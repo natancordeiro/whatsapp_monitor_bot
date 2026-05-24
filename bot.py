@@ -148,6 +148,8 @@ def encontrar_citacoes(mensagens: list, target_msg_id: str) -> list:
     citacoes = []
     for msg in mensagens:
         context_info = msg.get("contextInfo", {})
+        if not context_info:
+            continue
         if context_info.get("stanzaId", "") == target_msg_id:
             citacoes.append(msg)
     return citacoes
