@@ -28,7 +28,7 @@ EVOLUTION_URL        = os.getenv("EVOLUTION_URL",         "http://localhost:8080
 EVOLUTION_API_KEY    = os.getenv("EVOLUTION_API_KEY",     "")
 INSTANCE_NAME        = os.getenv("INSTANCE_NAME",         "")
 TARGET_GROUP_JID     = os.getenv("TARGET_GROUP_JID",      "")   # ex: 120363XXXXX@g.us
-TARGET_NUMBER        = os.getenv("TARGET_NUMBER",         "")   # ex: 5511999999999
+TARGET_NAME          = os.getenv("TARGET_NAME",           "")   # ex: Natan Targino (pushName)
 EMOJI_REPLY          = os.getenv("EMOJI_REPLY",           "🔥")
 WEBHOOK_PORT         = int(os.getenv("WEBHOOK_PORT",       "5000"))
 CHECK_DELAY_SECONDS  = float(os.getenv("CHECK_DELAY_SECONDS", "2.0"))
@@ -101,7 +101,7 @@ def enviar_emoji_citando(group_jid: str, msg_id: str, participant_jid: str, text
         return None
 
 
-def buscar_mensagens_grupo(group_jid: str, limit: int = 150) -> list:
+def buscar_mensagens_grupo(group_jid: str, limit: int = 50) -> list:
     """
     Busca as últimas mensagens do grupo via EvolutionAPI.
     Suporta a estrutura de resposta do EvolutionAPI v1 e v2.
@@ -137,25 +137,13 @@ def encontrar_citacoes(mensagens: list, target_msg_id: str) -> list:
     Verifica os campos contextInfo dos tipos de mensagem mais comuns.
     """
     citacoes = []
-    tipos_com_contexto = [
-        "extendedTextMessage",
-        "imageMessage",
-        "videoMessage",
-        "audioMessage",
-        "documentMessage",
-        "stickerMessage",
-    ]
 
     for msg in mensagens:
-        conteudo = msg.get("message", {})
         context_info = {}
-
-        for tipo in tipos_com_contexto:
-            ctx = conteudo.get(tipo, {}).get("contextInfo", {})
-            if ctx:
-                context_info = ctx
-                break
-
+        
+        context_info = msg.get("contextInfo", {})
+        if not context_info:
+            continue
         stanza_id = context_info.get("stanzaId", "")
         if stanza_id == target_msg_id:
             citacoes.append(msg)
@@ -170,7 +158,7 @@ def verificar_se_fomos_primeiro(group_jid: str, target_msg_id: str, nosso_msg_id
 
     Retorna True se fomos os primeiros, False caso contrário.
     """
-    mensagens = buscar_mensagens_grupo(group_jid, limit=200)
+    mensagens = buscar_mensagens_grupo(group_jid, limit=50)
     if not mensagens:
         log.warning("  ⚠️  Não consegui buscar mensagens para verificação.")
         return False
@@ -282,6 +270,7 @@ def processar_mensagem_alvo(msg_data: dict):
 def webhook():
     data  = request.json or {}
     event = data.get("event", "")
+    print(data)  # Debug: imprimir o payload recebido
 
     # Ignorar eventos que não sejam de mensagens recebidas
     if event != "messages.upsert":
@@ -299,19 +288,18 @@ def webhook():
         # ── Filtros ──────────────────────────────────────────
 
         # Ignorar mensagens próprias
-        if from_me:
-            continue
+        # if from_me:
+        #     continue
 
         # Verificar se é o grupo alvo
         if remote_jid != TARGET_GROUP_JID:
             continue
 
-        # Verificar se o remetente é o número alvo
-        participant   = key.get("participant", "")
-        numero_sender = participant.replace("@s.whatsapp.net", "").replace("+", "")
-        numero_alvo   = TARGET_NUMBER.replace("+", "").replace("-", "").replace(" ", "")
+        # Verificar se o remetente é o alvo (via pushName)
+        push_name  = (msg_data.get("pushName") or "").strip().lower()
+        nome_alvo  = TARGET_NAME.strip().lower()
 
-        if numero_alvo not in numero_sender:
+        if not nome_alvo or push_name != nome_alvo:
             continue
 
         # Extrair texto
@@ -356,7 +344,7 @@ def health():
         "status":        "online",
         "instance":      INSTANCE_NAME,
         "grupo_alvo":    TARGET_GROUP_JID,
-        "numero_alvo":   TARGET_NUMBER,
+        "nome_alvo":     TARGET_NAME,
         "emoji":         EMOJI_REPLY,
         "max_tentativas": MAX_RETRIES,
         "delay_check":   f"{CHECK_DELAY_SECONDS}s"
@@ -373,7 +361,7 @@ if __name__ == "__main__":
     log.info("═" * 60)
     log.info(f"  Instância:       {INSTANCE_NAME}")
     log.info(f"  Grupo alvo:      {TARGET_GROUP_JID}")
-    log.info(f"  Número alvo:     {TARGET_NUMBER}")
+    log.info(f"  Nome alvo:       {TARGET_NAME}")
     log.info(f"  Emoji:           {EMOJI_REPLY}")
     log.info(f"  Porta Webhook:   {WEBHOOK_PORT}")
     log.info(f"  Delay checks:    {CHECK_DELAY_SECONDS}s")
