@@ -6,19 +6,33 @@ reaproveitar conexões TCP/TLS (mais rápido).
 """
 
 import os
+import time
 import logging
+import threading
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 log = logging.getLogger(__name__)
 
 EVOLUTION_URL     = os.getenv("EVOLUTION_URL",     "http://localhost:8080").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 
+# Session com pool grande + sem retry automático (queremos falha rápida pra
+# poder decidir a estratégia de retry no nível da aplicação).
 session = requests.Session()
 session.headers.update({
     "apikey": EVOLUTION_API_KEY,
     "Content-Type": "application/json",
+    "Connection": "keep-alive",
 })
+_adapter = HTTPAdapter(
+    pool_connections=32,
+    pool_maxsize=64,
+    max_retries=Retry(total=0, connect=0, read=0, redirect=0),
+)
+session.mount("http://",  _adapter)
+session.mount("https://", _adapter)
 
 
 class EvolutionError(Exception):
@@ -44,6 +58,23 @@ def warmup():
         log.info("🔌 EvolutionAPI conectada (warmup ok).")
     except Exception:
         log.warning("⚠️ Warmup falhou — talvez a Evolution esteja offline.")
+
+
+def iniciar_keepalive_loop(intervalo_seg: int = 25):
+    """
+    Faz um GET leve a cada `intervalo_seg` segundos pra manter a conexão TCP/TLS
+    quente no pool. Sem isso, depois de ~60s ociosos, o servidor fecha a conexão
+    e o próximo POST paga handshake (~100-300ms a mais).
+    """
+    def _loop():
+        while True:
+            time.sleep(intervalo_seg)
+            try:
+                session.get(f"{EVOLUTION_URL}/instance/fetchInstances", timeout=3)
+            except Exception:
+                pass
+    t = threading.Thread(target=_loop, daemon=True, name="evolution-keepalive")
+    t.start()
 
 
 # ── Instâncias ──────────────────────────────────────────────

@@ -11,10 +11,27 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from typing import Optional
+from typing import Callable, Optional
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 _lock = threading.Lock()
+
+# Hook injetado pelo bot-prd.py para invalidar cache em memória ao gravar.
+# Mantém o db.py desacoplado da camada de cache.
+_invalidate_hook: Optional[Callable[[Optional[str]], None]] = None
+
+
+def set_invalidate_hook(fn: Callable[[Optional[str]], None]):
+    global _invalidate_hook
+    _invalidate_hook = fn
+
+
+def _invalidate(name: Optional[str] = None):
+    if _invalidate_hook:
+        try:
+            _invalidate_hook(name)
+        except Exception:
+            pass
 
 
 def _connect() -> sqlite3.Connection:
@@ -101,11 +118,13 @@ def criar_instancia(name: str):
     with cursor() as c:
         c.execute("INSERT OR IGNORE INTO instances (name) VALUES (?)", (name,))
         c.execute("INSERT OR IGNORE INTO stats (instance_name) VALUES (?)", (name,))
+    _invalidate(name)
 
 
 def remover_instancia(name: str):
     with cursor() as c:
         c.execute("DELETE FROM instances WHERE name = ?", (name,))
+    _invalidate(name)
 
 
 def get_instancia(name: str) -> Optional[dict]:
@@ -128,6 +147,7 @@ def atualizar_instancia(name: str, **kwargs):
     valores = list(kwargs.values()) + [name]
     with cursor() as c:
         c.execute(f"UPDATE instances SET {campos} WHERE name = ?", valores)
+    _invalidate(name)
 
 
 def set_ativo(name: str, ativo: bool):

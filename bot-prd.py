@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 """
 ════════════════════════════════════════════════════════════════
-  WhatsApp Group Monitor Bot — EvolutionAPI  [Multi-instância]
+  WhatsApp Group Monitor Bot — EvolutionAPI  [HOT PATH ⚡]
   Autor: TGN Technologies
 
-  Arquitetura:
-    • Multi-instância: cada registro em `instances` tem seu próprio
-      grupo alvo, nome alvo e emoji. O webhook roteia por instância.
-    • Sem cooldown: ao ser o primeiro, a instância é AUTO-DESLIGADA.
-      O cliente liga de novo pelo Telegram quando quiser.
-    • Controle 100% pelo Telegram (ver telegram_handlers.py).
+  Arquitetura otimizada para minimizar o tempo entre
+  recebimento do webhook e envio do emoji:
 
-  Comandos Telegram principais: /menu, /ajuda, /meuid
+    1. Cache em memória das instâncias  → 0 SQLite reads no hot path
+    2. ThreadPoolExecutor                → sem fila/worker, paralelismo real
+    3. Send-first, log/db-later          → POST p/ Evolution antes de qualquer I/O
+    4. Logging assíncrono (QueueHandler) → escrita em arquivo fora do hot path
+    5. requests.Session com pool 64       → reuso TCP/TLS
+    6. Keep-alive periódico               → conexão sempre quente
+    7. Waitress em produção (Dockerfile) → WSGI threaded de verdade
 ════════════════════════════════════════════════════════════════
 """
 
 import os
 import time
-import queue
 import logging
 import threading
 from datetime import datetime
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from logging.handlers import QueueHandler, QueueListener
+from queue import Queue
 
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -33,39 +37,83 @@ import evolution
 import telegram_handlers
 
 # ─────────────────────────────────────────────────────────────
-# CONFIG (somente infra: porta, log, bootstrap de admins)
+# CONFIG (somente infra)
 # ─────────────────────────────────────────────────────────────
-WEBHOOK_PORT     = int(os.getenv("WEBHOOK_PORT", "5000"))
-WEBHOOK_URL      = os.getenv("WEBHOOK_URL", "").rstrip("/")   # ex: http://meu-ip:5000
-ADMIN_CHAT_IDS   = [int(x) for x in os.getenv("ADMIN_CHAT_IDS", "").replace(" ", "").split(",") if x]
-LOG_PATH         = os.getenv("LOG_PATH", "bot.log")
+WEBHOOK_PORT   = int(os.getenv("WEBHOOK_PORT", "5000"))
+WEBHOOK_URL    = os.getenv("WEBHOOK_URL", "").rstrip("/")
+ADMIN_CHAT_IDS = [int(x) for x in os.getenv("ADMIN_CHAT_IDS", "").replace(" ", "").split(",") if x]
+LOG_PATH       = os.getenv("LOG_PATH", "bot.log")
+SEND_POOL_SIZE = int(os.getenv("SEND_POOL_SIZE", "16"))
 
 # ─────────────────────────────────────────────────────────────
-# LOG
+# LOGGING ASSÍNCRONO
+# Hot path emite com QueueHandler (zerinho de I/O); listener
+# em thread separada persiste em arquivo/stdout/buffer.
 # ─────────────────────────────────────────────────────────────
-log_buffer: deque[str] = deque(maxlen=50)
+log_buffer: deque[str] = deque(maxlen=100)
 
 class BufferHandler(logging.Handler):
     def emit(self, record):
         log_buffer.append(self.format(record))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH, encoding="utf-8"),
-        logging.StreamHandler(),
-        BufferHandler(),
-    ]
-)
+_log_queue: Queue = Queue(-1)
+
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_handlers_reais = [
+    logging.FileHandler(LOG_PATH, encoding="utf-8"),
+    logging.StreamHandler(),
+    BufferHandler(),
+]
+for h in _handlers_reais:
+    h.setFormatter(_fmt)
+
+_listener = QueueListener(_log_queue, *_handlers_reais, respect_handler_level=False)
+_listener.start()
+
+root = logging.getLogger()
+root.setLevel(logging.INFO)
+root.addHandler(QueueHandler(_log_queue))
+
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
-# Fila + dedupe por msg_id
+# CACHE EM MEMÓRIA DE INSTÂNCIAS
+# Sem isso pagamos SQLite + lock global toda vez que chega um webhook.
 # ─────────────────────────────────────────────────────────────
-fila_mensagens: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+_inst_cache: dict[str, dict | None] = {}
+_inst_cache_lock = threading.Lock()
+
+
+def _cache_get(name: str) -> dict | None:
+    with _inst_cache_lock:
+        if name in _inst_cache:
+            return _inst_cache[name]
+    inst = db.get_instancia(name)
+    with _inst_cache_lock:
+        _inst_cache[name] = inst
+    return inst
+
+
+def _cache_invalidate(name: str | None = None):
+    with _inst_cache_lock:
+        if name is None:
+            _inst_cache.clear()
+        else:
+            _inst_cache.pop(name, None)
+
+# Plugando o invalidator no módulo db
+db.set_invalidate_hook(_cache_invalidate)
+
+# ─────────────────────────────────────────────────────────────
+# DEDUPE — mensagens já processadas
+# ─────────────────────────────────────────────────────────────
 em_processamento: set[str] = set()
 em_processamento_lock = threading.Lock()
+
+# ─────────────────────────────────────────────────────────────
+# THREAD POOL — todo envio passa por aqui (sem fila intermediária)
+# ─────────────────────────────────────────────────────────────
+executor = ThreadPoolExecutor(max_workers=SEND_POOL_SIZE, thread_name_prefix="send")
 
 # ─────────────────────────────────────────────────────────────
 # Flask
@@ -74,7 +122,7 @@ app = Flask(__name__)
 
 
 # ═════════════════════════════════════════════════════════════
-# Processamento (verificação assíncrona + retry + auto-stop)
+# Verificação assíncrona (em background, fora do hot path)
 # ═════════════════════════════════════════════════════════════
 
 def _encontrar_citacoes(mensagens: list, target_msg_id: str) -> list:
@@ -87,7 +135,7 @@ def _encontrar_citacoes(mensagens: list, target_msg_id: str) -> list:
 
 
 def _verificar_se_primeiro(instance_name: str, group_jid: str,
-                           target_msg_id: str, nosso_msg_id: str) -> bool:
+                            target_msg_id: str, nosso_msg_id: str) -> bool:
     try:
         mensagens = evolution.buscar_mensagens(instance_name, group_jid, limit=50)
     except Exception as e:
@@ -97,11 +145,8 @@ def _verificar_se_primeiro(instance_name: str, group_jid: str,
     citacoes = _encontrar_citacoes(mensagens, target_msg_id)
     if not citacoes:
         return False
-
     citacoes.sort(key=lambda x: x.get("messageTimestamp", 0))
-    primeiro_id = citacoes[0].get("key", {}).get("id", "")
-    log.info(f"[{instance_name}] {len(citacoes)} citações | primeiro: ...{primeiro_id[-12:]}")
-    return primeiro_id == nosso_msg_id
+    return citacoes[0].get("key", {}).get("id", "") == nosso_msg_id
 
 
 def _verificar_e_retry(instance_name: str, group_jid: str, msg_id: str,
@@ -111,13 +156,12 @@ def _verificar_e_retry(instance_name: str, group_jid: str, msg_id: str,
     time.sleep(check_delay)
 
     if _verificar_se_primeiro(instance_name, group_jid, msg_id, nosso_msg_id):
-        log.info(f"🏆 [{instance_name}] FOMOS OS PRIMEIROS!")
+        log.info(f"🏆 [{instance_name}] FOMOS OS PRIMEIROS! (tentativa {tentativa})")
         db.incrementar_sucesso(instance_name, datetime.now().isoformat(timespec="seconds"))
-        db.set_ativo(instance_name, False)   # ⏸ auto-stop
+        db.set_ativo(instance_name, False)
         telegram_handlers.notificar_admins(
             f"🏆 *[{instance_name}]* FOMOS OS PRIMEIROS!\n"
-            f"Instância *desligada automaticamente*.\n"
-            f"Use /menu para religar quando quiser."
+            f"Instância desligada automaticamente."
         )
         with em_processamento_lock:
             em_processamento.discard(msg_id)
@@ -134,7 +178,7 @@ def _verificar_e_retry(instance_name: str, group_jid: str, msg_id: str,
             em_processamento.discard(msg_id)
         return
 
-    log.info(f"[{instance_name}] tentativa {tentativa + 1}/{max_retries}")
+    log.info(f"[{instance_name}] reenvio tentativa {tentativa + 1}/{max_retries}")
     try:
         nova = evolution.enviar_emoji_citando(instance_name, group_jid, msg_id,
                                               participant, texto, emoji)
@@ -151,77 +195,81 @@ def _verificar_e_retry(instance_name: str, group_jid: str, msg_id: str,
             em_processamento.discard(msg_id)
         return
 
-    threading.Thread(
-        target=_verificar_e_retry,
-        args=(instance_name, group_jid, msg_id, participant, texto, emoji,
-              novo_id, tentativa + 1, max_retries, check_delay),
-        daemon=True
-    ).start()
-
-
-def _processar(instance_name: str, msg_data: dict):
-    """Envia primeiro emoji e dispara verificação assíncrona."""
-    inst = db.get_instancia(instance_name)
-    if not inst or not inst["ativo"]:
-        return
-
-    key         = msg_data.get("key", {})
-    msg_id      = key.get("id", "")
-    group_jid   = key.get("remoteJid", "")
-    participant = key.get("participant", "")
-    message     = msg_data.get("message", {})
-    texto       = (message.get("conversation", "") or
-                   message.get("extendedTextMessage", {}).get("text", ""))
-    emoji       = inst["emoji"] or "🔥"
-    max_retries = inst["max_retries"]
-    check_delay = inst["check_delay"]
-
-    log.info("━" * 50)
-    log.info(f"🎯 [{instance_name}] alvo detectado: {texto[:80]}")
-
-    telegram_handlers.notificar_admins(
-        f"🎯 *[{instance_name}]* detectado!\n`{texto[:100]}`\nEnviando..."
-    )
-
-    try:
-        resp = evolution.enviar_emoji_citando(instance_name, group_jid, msg_id,
-                                              participant, texto, emoji)
-        db.incrementar_tentativa(instance_name)
-    except Exception as e:
-        log.error(f"[{instance_name}] erro no envio inicial: {e}")
-        with em_processamento_lock:
-            em_processamento.discard(msg_id)
-        return
-
-    nosso_id = resp.get("key", {}).get("id", "")
-    if not nosso_id:
-        log.error(f"[{instance_name}] API não devolveu ID.")
-        with em_processamento_lock:
-            em_processamento.discard(msg_id)
-        return
-
-    threading.Thread(
-        target=_verificar_e_retry,
-        args=(instance_name, group_jid, msg_id, participant, texto, emoji,
-              nosso_id, 1, max_retries, check_delay),
-        daemon=True
-    ).start()
-
-
-def _worker_loop():
-    log.info("⚙️  Worker iniciado.")
-    while True:
-        try:
-            instance_name, msg_data = fila_mensagens.get(timeout=30)
-            _processar(instance_name, msg_data)
-        except queue.Empty:
-            continue
-        except Exception as e:
-            log.exception(f"Erro no worker: {e}")
+    executor.submit(_verificar_e_retry, instance_name, group_jid, msg_id,
+                    participant, texto, emoji, novo_id, tentativa + 1,
+                    max_retries, check_delay)
 
 
 # ═════════════════════════════════════════════════════════════
-# Webhook
+# HOT PATH ⚡  — função única que é chamada pelo executor
+#   1. Envia POST IMEDIATAMENTE (esse é o único trabalho crítico)
+#   2. Tudo o resto (log, db, telegram, verify) vem depois
+# ═════════════════════════════════════════════════════════════
+
+def _enviar_imediato(instance_name: str, inst: dict, msg_data: dict, t_webhook: float):
+    key         = msg_data["key"]
+    msg_id      = key["id"]
+    group_jid   = key["remoteJid"]
+    participant = key.get("participant", "")
+    message     = msg_data.get("message") or {}
+    texto       = (message.get("conversation")
+                   or (message.get("extendedTextMessage") or {}).get("text")
+                   or "")
+    emoji       = inst["emoji"] or "🔥"
+
+    t_send = time.perf_counter()
+    try:
+        resp = evolution.enviar_emoji_citando(instance_name, group_jid, msg_id,
+                                              participant, texto, emoji)
+    except Exception as e:
+        log.error(f"⚡ [{instance_name}] FALHOU envio: {e}")
+        with em_processamento_lock:
+            em_processamento.discard(msg_id)
+        return
+
+    t_done = time.perf_counter()
+    nosso_id = (resp.get("key") or {}).get("id", "")
+
+    # ── Telemetria ──────────────────────────────────────────
+    dt_wh_to_send = (t_send  - t_webhook) * 1000   # webhook → começo POST
+    dt_post       = (t_done  - t_send)    * 1000   # tempo da Evolution
+    dt_total      = (t_done  - t_webhook) * 1000   # total
+    log.info(
+        f"⚡ [{instance_name}] emoji enviado | "
+        f"interno={dt_wh_to_send:.0f}ms | post={dt_post:.0f}ms | total={dt_total:.0f}ms | "
+        f"texto={texto[:60]!r}"
+    )
+
+    # ── Pós-envio (sem afetar o tempo de resposta) ──────────
+    executor.submit(_pos_envio, instance_name, inst, group_jid, msg_id,
+                    participant, texto, emoji, nosso_id)
+
+
+def _pos_envio(instance_name: str, inst: dict, group_jid: str, msg_id: str,
+                participant: str, texto: str, emoji: str, nosso_id: str):
+    """Tudo que pode esperar: telemetria, telegram, verificação."""
+    try:
+        db.incrementar_tentativa(instance_name)
+    except Exception as e:
+        log.warning(f"incrementar_tentativa: {e}")
+
+    telegram_handlers.notificar_admins(
+        f"🎯 *[{instance_name}]* alvo detectado!\n`{texto[:120]}`"
+    )
+
+    if not nosso_id:
+        log.error(f"[{instance_name}] Evolution não devolveu ID — não vou verificar.")
+        with em_processamento_lock:
+            em_processamento.discard(msg_id)
+        return
+
+    executor.submit(_verificar_e_retry, instance_name, group_jid, msg_id,
+                    participant, texto, emoji, nosso_id, 1,
+                    inst["max_retries"], inst["check_delay"])
+
+
+# ═════════════════════════════════════════════════════════════
+# WEBHOOK — só faz validação rápida e despacha
 # ═════════════════════════════════════════════════════════════
 
 def _evento_normalizado(event: str) -> str:
@@ -229,56 +277,50 @@ def _evento_normalizado(event: str) -> str:
 
 
 @app.route("/webhook", methods=["POST"])
-@app.route("/webhook/<path:_>", methods=["POST"])   # Evolution pode enviar com sufixo
+@app.route("/webhook/<path:_>", methods=["POST"])
 def webhook(_=None):
-    data  = request.json or {}
+    t_webhook = time.perf_counter()
+
+    data = request.get_json(silent=True) or {}
     event = _evento_normalizado(data.get("event", ""))
 
-    instance_name = data.get("instance") or data.get("instanceName") or ""
-
     if event != "messages.upsert":
-        return jsonify({"status": "ignored", "event": event})
+        return jsonify({"status": "ignored"})
 
+    instance_name = data.get("instance") or data.get("instanceName") or ""
     if not instance_name:
-        log.warning(f"⚠️ payload sem instance — keys: {list(data.keys())}")
         return jsonify({"status": "no_instance"})
 
-    inst = db.get_instancia(instance_name)
+    inst = _cache_get(instance_name)
     if not inst:
-        # Comum: outras instâncias da mesma Evolution mandam pra cá também.
-        # Silencioso pra não poluir o log.
-        return jsonify({"status": "unknown_instance", "instance": instance_name})
-
-    log.info(f"📩 webhook IN  event={event!r}  instance={instance_name!r}")
+        return jsonify({"status": "unknown_instance"})
     if not inst["ativo"]:
-        log.info(f"  ⏸ instância '{instance_name}' desligada.")
-        return jsonify({"status": "paused", "instance": instance_name})
+        return jsonify({"status": "paused"})
 
     target_group = inst["target_group_jid"]
     target_name  = (inst["target_name"] or "").strip().lower()
     if not target_group or not target_name:
-        log.warning(f"  ⚠️ '{instance_name}' sem grupo/nome configurado.")
-        return jsonify({"status": "not_configured", "instance": instance_name})
+        return jsonify({"status": "not_configured"})
 
     msgs = data.get("data", [])
     if isinstance(msgs, dict):
         msgs = [msgs]
 
+    despachados = 0
     for msg_data in msgs:
-        key        = msg_data.get("key", {})
+        key        = msg_data.get("key") or {}
         remote_jid = key.get("remoteJid", "")
-        push_name_raw = (msg_data.get("pushName") or "").strip()
-        log.info(f"  📨 msg de '{push_name_raw}' em {remote_jid} | alvo={inst['target_name']} {target_group}")
         if remote_jid != target_group:
             continue
 
-        push_name = push_name_raw.lower()
+        push_name = (msg_data.get("pushName") or "").strip().lower()
         if push_name != target_name:
             continue
 
-        message = msg_data.get("message", {})
-        texto = (message.get("conversation", "") or
-                 message.get("extendedTextMessage", {}).get("text", ""))
+        message = msg_data.get("message") or {}
+        texto = (message.get("conversation")
+                 or (message.get("extendedTextMessage") or {}).get("text")
+                 or "")
         if not texto or "@" in texto:
             continue
 
@@ -288,44 +330,59 @@ def webhook(_=None):
                 continue
             em_processamento.add(msg_id)
 
-        fila_mensagens.put((instance_name, msg_data))
+        # ⚡ Submete IMEDIATAMENTE. Não bloqueia o webhook.
+        executor.submit(_enviar_imediato, instance_name, inst, msg_data, t_webhook)
+        despachados += 1
 
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "despachados": despachados})
 
 
 @app.route("/health", methods=["GET"])
 def health():
     instancias = db.listar_instancias()
     return jsonify({
-        "status":     "online",
-        "instances":  [
+        "status":    "online",
+        "instances": [
             {"name": i["name"], "ativo": bool(i["ativo"]),
              "grupo": i["target_group_jid"], "alvo": i["target_name"]}
             for i in instancias
         ],
-        "fila":       fila_mensagens.qsize(),
+        "pool_size": SEND_POOL_SIZE,
     })
 
 
 # ═════════════════════════════════════════════════════════════
-# MAIN
+# MAIN — usa waitress em produção (Linux/Docker), Flask local
 # ═════════════════════════════════════════════════════════════
+
+def _run_server():
+    try:
+        from waitress import serve
+        log.info(f"  Servindo via waitress (threads={SEND_POOL_SIZE * 2})")
+        serve(app, host="0.0.0.0", port=WEBHOOK_PORT,
+              threads=SEND_POOL_SIZE * 2, _quiet=True)
+    except ImportError:
+        log.info("  waitress não disponível — usando Flask dev server.")
+        app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False, threaded=True)
+
 
 if __name__ == "__main__":
     log.info("═" * 60)
-    log.info("  🤖 WhatsApp Monitor Bot — Multi-instância")
+    log.info("  🤖 WhatsApp Monitor Bot — HOT PATH ⚡")
     log.info("═" * 60)
 
     db.init_db(seed_admins=ADMIN_CHAT_IDS)
-    log.info(f"  Admins:    {db.listar_admins()}")
+    log.info(f"  Admins:     {db.listar_admins()}")
     log.info(f"  Instâncias: {[i['name'] for i in db.listar_instancias()]}")
-    log.info(f"  Porta:     {WEBHOOK_PORT}")
+    log.info(f"  Pool size:  {SEND_POOL_SIZE}")
+    log.info(f"  Porta:      {WEBHOOK_PORT}")
     log.info("═" * 60)
 
     evolution.warmup()
+    evolution.iniciar_keepalive_loop(intervalo_seg=25)
 
-    threading.Thread(target=_worker_loop, daemon=True).start()
-    threading.Thread(target=telegram_handlers.iniciar_polling, daemon=True).start()
+    threading.Thread(target=telegram_handlers.iniciar_polling,
+                     daemon=True, name="telegram-polling").start()
 
-    log.info(f"  Webhook: http://SEU-IP:{WEBHOOK_PORT}/webhook\n")
-    app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False)
+    log.info(f"  Webhook: {WEBHOOK_URL or f'http://SEU-IP:{WEBHOOK_PORT}'}/webhook\n")
+    _run_server()
