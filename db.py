@@ -8,6 +8,7 @@ Tabelas:
 """
 
 import os
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -152,6 +153,42 @@ def atualizar_instancia(name: str, **kwargs):
 
 def set_ativo(name: str, ativo: bool):
     atualizar_instancia(name, ativo=1 if ativo else 0)
+
+
+# ── Múltiplos alvos por instância ───────────────────────────
+# Persistidos como JSON na coluna `target_name`. Compat: se vier texto
+# simples (instância antiga), tratamos como lista de 1 elemento.
+
+def parse_target_names(raw: Optional[str]) -> list[str]:
+    if not raw:
+        return []
+    raw = raw.strip()
+    if not raw:
+        return []
+    try:
+        v = json.loads(raw)
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return [raw]
+
+
+def get_target_names(instance_name: str) -> list[str]:
+    inst = get_instancia(instance_name)
+    return parse_target_names(inst["target_name"]) if inst else []
+
+
+def set_target_names(instance_name: str, names: list[str]):
+    limpos = [n.strip() for n in names if n and n.strip()]
+    # remove duplicatas mantendo ordem
+    vistos: set[str] = set()
+    unicos: list[str] = []
+    for n in limpos:
+        if n not in vistos:
+            vistos.add(n)
+            unicos.append(n)
+    atualizar_instancia(instance_name, target_name=json.dumps(unicos, ensure_ascii=False))
 
 
 # ── Stats ───────────────────────────────────────────────────

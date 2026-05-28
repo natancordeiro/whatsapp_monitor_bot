@@ -89,6 +89,10 @@ def _cache_get(name: str) -> dict | None:
         if name in _inst_cache:
             return _inst_cache[name]
     inst = db.get_instancia(name)
+    if inst:
+        # pré-computa set de alvos em lowercase pra o hot path ser O(1)
+        nomes = db.parse_target_names(inst["target_name"])
+        inst["_targets_lower"] = frozenset(n.strip().lower() for n in nomes if n.strip())
     with _inst_cache_lock:
         _inst_cache[name] = inst
     return inst
@@ -273,9 +277,9 @@ def webhook(_=None):
     if not inst["ativo"]:
         return jsonify({"status": "paused"})
 
-    target_group = inst["target_group_jid"]
-    target_name  = (inst["target_name"] or "").strip().lower()
-    if not target_group or not target_name:
+    target_group  = inst["target_group_jid"]
+    targets_lower = inst.get("_targets_lower") or frozenset()
+    if not target_group or not targets_lower:
         return jsonify({"status": "not_configured"})
 
     msgs = data.get("data", [])
@@ -290,7 +294,7 @@ def webhook(_=None):
             continue
 
         push_name = (msg_data.get("pushName") or "").strip().lower()
-        if push_name != target_name:
+        if push_name not in targets_lower:
             continue
 
         message = msg_data.get("message") or {}

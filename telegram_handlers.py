@@ -154,7 +154,7 @@ def kb_instancia(name: str) -> types.InlineKeyboardMarkup:
         )
         kb.add(
             types.InlineKeyboardButton("👥 Trocar grupo", callback_data=f"inst:groups:{name}"),
-            types.InlineKeyboardButton("👤 Nome alvo",    callback_data=f"inst:name:{name}"),
+            types.InlineKeyboardButton("👤 Nomes alvo",   callback_data=f"inst:name:{name}"),
         )
         kb.add(
             types.InlineKeyboardButton("😀 Emoji",      callback_data=f"inst:emoji:{name}"),
@@ -175,11 +175,18 @@ def _resumo_instancia(name: str) -> str:
     s = db.get_stats(name)
     estado = "🟢 ATIVA" if inst["ativo"] else "🔴 PARADA"
     captura = s["ultima_captura"] or "nenhuma"
+    nomes = db.parse_target_names(inst["target_name"])
+    if not nomes:
+        alvos_str = "—"
+    elif len(nomes) <= 3:
+        alvos_str = ", ".join(nomes)
+    else:
+        alvos_str = f"{', '.join(nomes[:3])}  _(+{len(nomes) - 3})_"
     return (
         f"📱 *{name}* — {estado}\n"
         f"──────────────────\n"
         f"*Grupo:* `{(inst['target_group_jid'] or '—')[-25:]}`\n"
-        f"*Alvo:* {inst['target_name'] or '—'}\n"
+        f"*Alvos ({len(nomes)}):* {alvos_str}\n"
         f"*Emoji:* {inst['emoji']}\n"
         f"*Sucessos:* {s['sucesso']} | *Falhas:* {s['falha']}\n"
         f"*Última captura:* {captura}"
@@ -307,10 +314,12 @@ def _registrar_handlers():
                 if not inst:
                     bot.answer_callback_query(call.id, "Instância não encontrada.")
                     return
-                # Não deixa ligar sem grupo e nome alvo configurados
-                if not inst["ativo"] and (not inst["target_group_jid"] or not inst["target_name"]):
+                # Não deixa ligar sem grupo e ao menos um alvo configurados
+                if not inst["ativo"] and (not inst["target_group_jid"]
+                                         or not db.get_target_names(name)):
                     bot.answer_callback_query(call.id,
-                        "Configure grupo e nome alvo antes de ligar.", show_alert=True)
+                        "Configure grupo e pelo menos 1 nome alvo antes de ligar.",
+                        show_alert=True)
                     return
                 db.set_ativo(name, not inst["ativo"])
                 bot.answer_callback_query(call.id,
@@ -348,8 +357,27 @@ def _registrar_handlers():
                 if not push:
                     bot.answer_callback_query(call.id, "Lista expirou. Atualize.", show_alert=True)
                     return
-                db.atualizar_instancia(name, target_name=push)
-                bot.answer_callback_query(call.id, "Nome alvo atualizado.")
+                atual = set(db.get_target_names(name))
+                if push in atual:
+                    atual.discard(push)
+                    aviso = f"➖ Removido: {push}"
+                else:
+                    atual.add(push)
+                    aviso = f"➕ Adicionado: {push}"
+                db.set_target_names(name, sorted(atual))
+                _safe_answer(call.id, aviso)
+                pagina = _state(chat_id).get("name_page", 0)
+                _renderizar_pagina_participantes(chat_id, call.message.message_id, name, pagina)
+
+            elif data.startswith("inst:clearnames:"):
+                name = data.split(":", 2)[2]
+                db.set_target_names(name, [])
+                _safe_answer(call.id, "Todos os alvos removidos.")
+                pagina = _state(chat_id).get("name_page", 0)
+                _renderizar_pagina_participantes(chat_id, call.message.message_id, name, pagina)
+
+            elif data.startswith("inst:donename:"):
+                name = data.split(":", 2)[2]
                 _safe_edit(_resumo_instancia(name), chat_id, call.message.message_id,
                                       reply_markup=kb_instancia(name))
 
@@ -556,24 +584,24 @@ def _renderizar_pagina_participantes(chat_id: int, message_id: int,
     mapa = _state(chat_id).get("participants") or {}
     total = _state(chat_id).get("participants_n", 0)
     if not mapa:
-        # Cache evaporou — recarrega tudo
         _listar_participantes_para_escolha(chat_id, message_id, instance_name, page=0)
         return
 
     total_paginas = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, total_paginas - 1))
+    _state(chat_id)["name_page"] = page
+
     inicio = page * PAGE_SIZE
     fim    = min(inicio + PAGE_SIZE, total)
 
-    inst = db.get_instancia(instance_name) or {}
-    alvo_atual = inst.get("target_name", "")
+    selecionados = set(db.get_target_names(instance_name))
 
-    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb = types.InlineKeyboardMarkup(row_width=1)
     for i in range(inicio, fim):
         push = mapa[i]
-        marca = "✅ " if push == alvo_atual else ""
+        marca = "✅ " if push in selecionados else "▫️ "
         kb.add(types.InlineKeyboardButton(
-            f"{marca}{push[:40]}",
+            f"{marca}{push[:38]}",
             callback_data=f"inst:setname:{instance_name}:{i}"
         ))
 
@@ -581,20 +609,24 @@ def _renderizar_pagina_participantes(chat_id: int, message_id: int,
     nav = []
     if page > 0:
         nav.append(types.InlineKeyboardButton(
-            "◀️ Anterior", callback_data=f"inst:namepg:{instance_name}:{page - 1}"))
+            "◀️", callback_data=f"inst:namepg:{instance_name}:{page - 1}"))
     nav.append(types.InlineKeyboardButton(
         f"{page + 1}/{total_paginas}", callback_data=f"inst:namepg:{instance_name}:{page}"))
     if page < total_paginas - 1:
         nav.append(types.InlineKeyboardButton(
-            "Próxima ▶️", callback_data=f"inst:namepg:{instance_name}:{page + 1}"))
+            "▶️", callback_data=f"inst:namepg:{instance_name}:{page + 1}"))
     kb.row(*nav)
 
-    kb.add(types.InlineKeyboardButton("🔄 Atualizar lista", callback_data=f"inst:name:{instance_name}"))
-    kb.add(types.InlineKeyboardButton("🔙 Voltar", callback_data=f"inst:open:{instance_name}"))
+    kb.row(
+        types.InlineKeyboardButton("🔄 Atualizar", callback_data=f"inst:name:{instance_name}"),
+        types.InlineKeyboardButton("🗑️ Limpar",    callback_data=f"inst:clearnames:{instance_name}"),
+    )
+    kb.add(types.InlineKeyboardButton("✅ Concluir", callback_data=f"inst:donename:{instance_name}"))
 
     _safe_edit(
-        f"👤 *Selecione o nome alvo* (pushName) para `{instance_name}`:\n"
-        f"_{total} pessoas no total — mostrando {inicio + 1}-{fim}._",
+        f"👤 *Toque para marcar/desmarcar* os alvos de `{instance_name}`:\n"
+        f"_{len(selecionados)} selecionado(s) · {total} pessoas no grupo · "
+        f"mostrando {inicio + 1}-{fim}._",
         chat_id, message_id, reply_markup=kb
     )
 
