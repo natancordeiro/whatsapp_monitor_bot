@@ -56,9 +56,12 @@ def cursor():
 
 def init_db(seed_admins: list[int] | None = None):
     with cursor() as c:
+        # users (substitui admins): role pode ser 'admin' ou 'user'
         c.execute("""
-            CREATE TABLE IF NOT EXISTS admins (
-                chat_id INTEGER PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id  INTEGER PRIMARY KEY,
+                role     TEXT NOT NULL DEFAULT 'user',
+                name     TEXT,
                 added_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -71,6 +74,7 @@ def init_db(seed_admins: list[int] | None = None):
                 ativo            INTEGER DEFAULT 0,
                 check_delay      REAL DEFAULT 1.5,
                 max_retries      INTEGER DEFAULT 10,
+                owner_chat_id    INTEGER,
                 criado_em        TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -84,40 +88,98 @@ def init_db(seed_admins: list[int] | None = None):
                 FOREIGN KEY (instance_name) REFERENCES instances(name) ON DELETE CASCADE
             )
         """)
+
+        # ── Migração: tabela 'admins' antiga → 'users' com role=admin ──
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='admins'")
+        if c.fetchone():
+            c.execute("""
+                INSERT OR IGNORE INTO users (chat_id, role)
+                SELECT chat_id, 'admin' FROM admins
+            """)
+            c.execute("DROP TABLE admins")
+
+        # ── Migração: instances sem owner_chat_id ──
+        c.execute("PRAGMA table_info(instances)")
+        cols = [row["name"] for row in c.fetchall()]
+        if "owner_chat_id" not in cols:
+            c.execute("ALTER TABLE instances ADD COLUMN owner_chat_id INTEGER")
+
+        # Seed admins do .env (cria ou promove a admin)
         if seed_admins:
             for chat_id in seed_admins:
-                c.execute("INSERT OR IGNORE INTO admins (chat_id) VALUES (?)", (chat_id,))
+                c.execute("""
+                    INSERT INTO users (chat_id, role) VALUES (?, 'admin')
+                    ON CONFLICT(chat_id) DO UPDATE SET role='admin'
+                """, (chat_id,))
+
+        # Adopta instâncias órfãs (sem dono) pro primeiro admin disponível
+        c.execute("SELECT chat_id FROM users WHERE role='admin' ORDER BY chat_id LIMIT 1")
+        row = c.fetchone()
+        if row:
+            c.execute("UPDATE instances SET owner_chat_id = ? WHERE owner_chat_id IS NULL",
+                      (row["chat_id"],))
 
 
-# ── Admins ──────────────────────────────────────────────────
+# ── Usuários (admin + user) ─────────────────────────────────
+
+def get_usuario(chat_id: int) -> Optional[dict]:
+    with cursor() as c:
+        c.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
+        row = c.fetchone()
+        return dict(row) if row else None
+
+
+def eh_usuario(chat_id: int) -> bool:
+    return get_usuario(chat_id) is not None
+
 
 def is_admin(chat_id: int) -> bool:
+    u = get_usuario(chat_id)
+    return bool(u and u.get("role") == "admin")
+
+
+def listar_usuarios() -> list[dict]:
     with cursor() as c:
-        c.execute("SELECT 1 FROM admins WHERE chat_id = ?", (chat_id,))
-        return c.fetchone() is not None
+        c.execute("SELECT * FROM users ORDER BY role DESC, chat_id")
+        return [dict(r) for r in c.fetchall()]
 
 
 def listar_admins() -> list[int]:
     with cursor() as c:
-        c.execute("SELECT chat_id FROM admins ORDER BY chat_id")
+        c.execute("SELECT chat_id FROM users WHERE role='admin' ORDER BY chat_id")
         return [row["chat_id"] for row in c.fetchall()]
 
 
-def adicionar_admin(chat_id: int):
+def adicionar_usuario(chat_id: int, role: str = "user", name: Optional[str] = None):
+    if role not in ("admin", "user"):
+        raise ValueError("role deve ser 'admin' ou 'user'")
     with cursor() as c:
-        c.execute("INSERT OR IGNORE INTO admins (chat_id) VALUES (?)", (chat_id,))
+        c.execute("""
+            INSERT INTO users (chat_id, role, name) VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                role = excluded.role,
+                name = COALESCE(excluded.name, users.name)
+        """, (chat_id, role, name))
 
 
-def remover_admin(chat_id: int):
+def remover_usuario(chat_id: int):
     with cursor() as c:
-        c.execute("DELETE FROM admins WHERE chat_id = ?", (chat_id,))
+        c.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
+
+
+def set_role(chat_id: int, role: str):
+    if role not in ("admin", "user"):
+        raise ValueError("role deve ser 'admin' ou 'user'")
+    with cursor() as c:
+        c.execute("UPDATE users SET role = ? WHERE chat_id = ?", (role, chat_id))
 
 
 # ── Instâncias ──────────────────────────────────────────────
 
-def criar_instancia(name: str):
+def criar_instancia(name: str, owner_chat_id: Optional[int] = None):
     with cursor() as c:
-        c.execute("INSERT OR IGNORE INTO instances (name) VALUES (?)", (name,))
+        c.execute("INSERT OR IGNORE INTO instances (name, owner_chat_id) VALUES (?, ?)",
+                  (name, owner_chat_id))
         c.execute("INSERT OR IGNORE INTO stats (instance_name) VALUES (?)", (name,))
     _invalidate(name)
 
@@ -135,10 +197,26 @@ def get_instancia(name: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
-def listar_instancias() -> list[dict]:
+def listar_instancias(owner_chat_id: Optional[int] = None) -> list[dict]:
     with cursor() as c:
-        c.execute("SELECT * FROM instances ORDER BY name")
+        if owner_chat_id is None:
+            c.execute("SELECT * FROM instances ORDER BY name")
+        else:
+            c.execute("SELECT * FROM instances WHERE owner_chat_id = ? ORDER BY name",
+                      (owner_chat_id,))
         return [dict(r) for r in c.fetchall()]
+
+
+def contar_instancias_do_dono(owner_chat_id: int) -> int:
+    with cursor() as c:
+        c.execute("SELECT COUNT(*) AS n FROM instances WHERE owner_chat_id = ?",
+                  (owner_chat_id,))
+        return c.fetchone()["n"]
+
+
+def get_owner(instance_name: str) -> Optional[int]:
+    inst = get_instancia(instance_name)
+    return inst.get("owner_chat_id") if inst else None
 
 
 def atualizar_instancia(name: str, **kwargs):

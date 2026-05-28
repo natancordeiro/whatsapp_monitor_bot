@@ -41,19 +41,41 @@ session_state: dict[int, dict] = {}
 # Helpers
 # ─────────────────────────────────────────────────────────────
 
-def _is_admin(chat_id: int) -> bool:
-    return db.is_admin(chat_id)
+def _chat_id_de(message_or_call) -> int:
+    return (message_or_call.from_user.id
+            if hasattr(message_or_call, "from_user")
+            else message_or_call.chat.id)
 
 
 def _check(message_or_call) -> bool:
-    chat_id = message_or_call.from_user.id if hasattr(message_or_call, "from_user") else message_or_call.chat.id
-    if _is_admin(chat_id):
+    """Permite qualquer usuário cadastrado (admin ou user)."""
+    chat_id = _chat_id_de(message_or_call)
+    if db.eh_usuario(chat_id):
         return True
     if isinstance(message_or_call, types.CallbackQuery):
         bot.answer_callback_query(message_or_call.id, "⛔ Acesso negado.")
     else:
         bot.reply_to(message_or_call, "⛔ Acesso não autorizado.")
     return False
+
+
+def _check_admin(message_or_call) -> bool:
+    """Bloqueia tudo que não seja role=admin."""
+    chat_id = _chat_id_de(message_or_call)
+    if db.is_admin(chat_id):
+        return True
+    if isinstance(message_or_call, types.CallbackQuery):
+        bot.answer_callback_query(message_or_call.id, "⛔ Só admin pode fazer isso.")
+    else:
+        bot.reply_to(message_or_call, "⛔ Só admin pode fazer isso.")
+    return False
+
+
+def _pode_ver(chat_id: int, instance_name: str) -> bool:
+    """Admin vê tudo; user só vê o que é dele."""
+    if db.is_admin(chat_id):
+        return True
+    return db.get_owner(instance_name) == chat_id
 
 
 def _state(chat_id: int) -> dict:
@@ -97,19 +119,23 @@ def notificar_admins(texto: str):
         notificar(chat_id, texto)
 
 
-def notificar_admins_com_menu_instancia(instance_name: str, prefixo: str = ""):
-    """Manda pros admins o resumo da instância + teclado inline (mesmo do menu)."""
+def notificar_dono_com_menu_instancia(instance_name: str, prefixo: str = ""):
+    """Manda pro DONO da instância o resumo + teclado inline."""
     if not bot:
         return
 
+    owner = db.get_owner(instance_name)
+    if not owner:
+        log.warning(f"instância '{instance_name}' sem dono — ninguém pra notificar.")
+        return
+
     def _send():
-        texto = (f"{prefixo}\n\n" if prefixo else "") + _resumo_instancia(instance_name)
+        texto = (f"{prefixo}\n\n" if prefixo else "") + _resumo_instancia(instance_name, owner)
         markup = kb_instancia(instance_name)
-        for chat_id in db.listar_admins():
-            try:
-                bot.send_message(chat_id, texto, reply_markup=markup)
-            except Exception as e:
-                log.warning(f"Telegram send error ({chat_id}): {e}")
+        try:
+            bot.send_message(owner, texto, reply_markup=markup)
+        except Exception as e:
+            log.warning(f"Telegram send para dono {owner}: {e}")
 
     threading.Thread(target=_send, daemon=True).start()
 
@@ -118,26 +144,36 @@ def notificar_admins_com_menu_instancia(instance_name: str, prefixo: str = ""):
 # Menus (InlineKeyboardMarkup)
 # ─────────────────────────────────────────────────────────────
 
-def kb_main() -> types.InlineKeyboardMarkup:
+def kb_main(viewer_chat_id: int | None = None) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton("📱 Instâncias", callback_data="menu:list_inst"),
         types.InlineKeyboardButton("➕ Criar", callback_data="menu:create_inst"),
     )
-    kb.add(
-        types.InlineKeyboardButton("📊 Status geral", callback_data="menu:status"),
-        types.InlineKeyboardButton("👥 Admins", callback_data="menu:admins"),
-    )
+    if viewer_chat_id is not None and db.is_admin(viewer_chat_id):
+        kb.add(
+            types.InlineKeyboardButton("📊 Status geral", callback_data="menu:status"),
+            types.InlineKeyboardButton("👥 Usuários",     callback_data="menu:users"),
+        )
+    else:
+        kb.add(types.InlineKeyboardButton("📊 Status", callback_data="menu:status"))
     return kb
 
 
-def kb_lista_instancias() -> types.InlineKeyboardMarkup:
+def kb_lista_instancias(viewer_chat_id: int) -> types.InlineKeyboardMarkup:
+    """Admin vê todas (com dono); usuário comum só vê as próprias."""
     kb = types.InlineKeyboardMarkup(row_width=1)
-    for inst in db.listar_instancias():
+    admin = db.is_admin(viewer_chat_id)
+    instancias = db.listar_instancias(owner_chat_id=None if admin else viewer_chat_id)
+    for inst in instancias:
         marca = "🟢" if inst["ativo"] else "🔴"
+        rotulo = f"{marca} {inst['name']}"
+        if admin and inst.get("owner_chat_id") and inst["owner_chat_id"] != viewer_chat_id:
+            dono = db.get_usuario(inst["owner_chat_id"]) or {}
+            dono_nome = dono.get("name") or str(inst["owner_chat_id"])
+            rotulo += f"  · {dono_nome}"
         kb.add(types.InlineKeyboardButton(
-            f"{marca} {inst['name']}",
-            callback_data=f"inst:open:{inst['name']}"
+            rotulo, callback_data=f"inst:open:{inst['name']}"
         ))
     kb.add(types.InlineKeyboardButton("🔙 Voltar", callback_data="menu:main"))
     return kb
@@ -168,7 +204,7 @@ def kb_instancia(name: str) -> types.InlineKeyboardMarkup:
     return kb
 
 
-def _resumo_instancia(name: str) -> str:
+def _resumo_instancia(name: str, viewer_chat_id: int | None = None) -> str:
     inst = db.get_instancia(name)
     if not inst:
         return f"❌ Instância `{name}` não existe."
@@ -182,9 +218,20 @@ def _resumo_instancia(name: str) -> str:
         alvos_str = ", ".join(nomes)
     else:
         alvos_str = f"{', '.join(nomes[:3])}  _(+{len(nomes) - 3})_"
+
+    # Mostra dono se o viewer é admin E o dono não é ele mesmo
+    linha_dono = ""
+    if viewer_chat_id and db.is_admin(viewer_chat_id):
+        owner = inst.get("owner_chat_id")
+        if owner and owner != viewer_chat_id:
+            dono = db.get_usuario(owner) or {}
+            nome_dono = dono.get("name") or str(owner)
+            linha_dono = f"*Dono:* `{nome_dono}`\n"
+
     return (
         f"📱 *{name}* — {estado}\n"
         f"──────────────────\n"
+        f"{linha_dono}"
         f"*Grupo:* `{(inst['target_group_jid'] or '—')[-25:]}`\n"
         f"*Alvos ({len(nomes)}):* {alvos_str}\n"
         f"*Emoji:* {inst['emoji']}\n"
@@ -207,7 +254,7 @@ def _registrar_handlers():
         bot.send_message(
             message.chat.id,
             "🤖 *WhatsApp Monitor Bot*\nEscolha uma opção:",
-            reply_markup=kb_main()
+            reply_markup=kb_main(message.from_user.id)
         )
 
     @bot.message_handler(commands=["meuid"])
@@ -217,40 +264,113 @@ def _registrar_handlers():
     @bot.message_handler(commands=["ajuda", "help"])
     def cmd_ajuda(message):
         if not _check(message): return
-        bot.reply_to(message,
+        admin = db.is_admin(message.from_user.id)
+        texto = (
             "*Comandos:*\n"
             "/menu — abrir menu principal\n"
             "/meuid — ver seu chat\\_id\n"
-            "/admin\\_add `<chat_id>` — adicionar admin\n"
-            "/admin\\_rm `<chat_id>` — remover admin\n"
-            "/ajuda — esta mensagem"
         )
+        if admin:
+            texto += (
+                "\n*Admin:*\n"
+                "/users — listar usuários\n"
+                "/user\\_add `<chat_id>` `[admin|user]` `[nome]`\n"
+                "/user\\_rm `<chat_id>`\n"
+                "/promote `<chat_id>` — tornar admin\n"
+                "/demote `<chat_id>` — rebaixar a user\n"
+            )
+        bot.reply_to(message, texto)
 
-    @bot.message_handler(commands=["admin_add"])
-    def cmd_admin_add(message):
-        if not _check(message): return
-        parts = message.text.split()
+    # ── Gestão de usuários (admin only) ───────────────────────
+
+    @bot.message_handler(commands=["users"])
+    def cmd_users(message):
+        if not _check_admin(message): return
+        usuarios = db.listar_usuarios()
+        if not usuarios:
+            bot.reply_to(message, "Nenhum usuário cadastrado.")
+            return
+        linhas = []
+        for u in usuarios:
+            badge = "👑" if u["role"] == "admin" else "👤"
+            nome  = u.get("name") or "—"
+            n_inst = db.contar_instancias_do_dono(u["chat_id"])
+            linhas.append(f"{badge} `{u['chat_id']}` · {nome} · {n_inst} inst.")
+        bot.reply_to(message, "👥 *Usuários*\n" + "\n".join(linhas))
+
+    @bot.message_handler(commands=["user_add"])
+    def cmd_user_add(message):
+        if not _check_admin(message): return
+        parts = message.text.split(maxsplit=3)
         if len(parts) < 2:
-            bot.reply_to(message, "Uso: /admin\\_add `<chat_id>`")
+            bot.reply_to(message, "Uso: /user\\_add `<chat_id>` `[admin|user]` `[nome]`")
             return
         try:
-            db.adicionar_admin(int(parts[1]))
-            bot.reply_to(message, f"✅ Admin `{parts[1]}` adicionado.")
+            chat_id = int(parts[1])
         except ValueError:
             bot.reply_to(message, "chat\\_id inválido.")
+            return
+        role = parts[2] if len(parts) > 2 else "user"
+        if role not in ("admin", "user"):
+            bot.reply_to(message, "Role inválida (use `admin` ou `user`).")
+            return
+        nome = parts[3] if len(parts) > 3 else None
+        db.adicionar_usuario(chat_id, role=role, name=nome)
+        bot.reply_to(message, f"✅ Usuário `{chat_id}` ({role}) salvo.")
 
-    @bot.message_handler(commands=["admin_rm"])
-    def cmd_admin_rm(message):
-        if not _check(message): return
+    @bot.message_handler(commands=["user_rm"])
+    def cmd_user_rm(message):
+        if not _check_admin(message): return
         parts = message.text.split()
         if len(parts) < 2:
-            bot.reply_to(message, "Uso: /admin\\_rm `<chat_id>`")
+            bot.reply_to(message, "Uso: /user\\_rm `<chat_id>`")
             return
         try:
-            db.remover_admin(int(parts[1]))
-            bot.reply_to(message, f"✅ Admin `{parts[1]}` removido.")
+            chat_id = int(parts[1])
         except ValueError:
             bot.reply_to(message, "chat\\_id inválido.")
+            return
+        if chat_id == message.from_user.id:
+            bot.reply_to(message, "⚠️ Você não pode remover a si mesmo.")
+            return
+        db.remover_usuario(chat_id)
+        bot.reply_to(message, f"✅ Usuário `{chat_id}` removido.")
+
+    @bot.message_handler(commands=["promote"])
+    def cmd_promote(message):
+        if not _check_admin(message): return
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "Uso: /promote `<chat_id>`")
+            return
+        try:
+            chat_id = int(parts[1])
+        except ValueError:
+            bot.reply_to(message, "chat\\_id inválido.")
+            return
+        if not db.eh_usuario(chat_id):
+            bot.reply_to(message, "Usuário não cadastrado. Use /user\\_add primeiro.")
+            return
+        db.set_role(chat_id, "admin")
+        bot.reply_to(message, f"👑 `{chat_id}` agora é admin.")
+
+    @bot.message_handler(commands=["demote"])
+    def cmd_demote(message):
+        if not _check_admin(message): return
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "Uso: /demote `<chat_id>`")
+            return
+        try:
+            chat_id = int(parts[1])
+        except ValueError:
+            bot.reply_to(message, "chat\\_id inválido.")
+            return
+        if chat_id == message.from_user.id:
+            bot.reply_to(message, "⚠️ Você não pode rebaixar a si mesmo.")
+            return
+        db.set_role(chat_id, "user")
+        bot.reply_to(message, f"👤 `{chat_id}` agora é user comum.")
 
     # ── Callbacks (inline keyboard) ───────────────────────────
 
@@ -259,24 +379,42 @@ def _registrar_handlers():
         if not _check(call): return
         data = call.data
         chat_id = call.message.chat.id
+        user_chat_id = call.from_user.id   # quem está clicando
+        admin = db.is_admin(user_chat_id)
+
+        # Guarda de propriedade para callbacks que tocam instância
+        if data.startswith("inst:"):
+            partes = data.split(":")
+            if len(partes) >= 3:
+                inst_alvo = partes[2]
+                if inst_alvo and not _pode_ver(user_chat_id, inst_alvo):
+                    _safe_answer(call.id, "⛔ Essa instância não é sua.", show_alert=True)
+                    return
 
         try:
             if data == "menu:main":
                 _safe_edit("🤖 *WhatsApp Monitor Bot*\nEscolha uma opção:",
-                                      chat_id, call.message.message_id, reply_markup=kb_main())
+                                      chat_id, call.message.message_id,
+                                      reply_markup=kb_main(user_chat_id))
 
             elif data == "menu:list_inst":
-                instancias = db.listar_instancias()
+                instancias = db.listar_instancias(None if admin else user_chat_id)
                 texto = "📱 *Instâncias cadastradas:*" if instancias else "Nenhuma instância ainda."
                 _safe_edit(texto, chat_id, call.message.message_id,
-                                      reply_markup=kb_lista_instancias())
+                                      reply_markup=kb_lista_instancias(user_chat_id))
 
             elif data == "menu:create_inst":
+                # Limite para usuários comuns
+                if not admin and db.contar_instancias_do_dono(user_chat_id) >= 1:
+                    _safe_answer(call.id,
+                        "Você já tem 1 instância. Remova-a antes de criar outra.",
+                        show_alert=True)
+                    return
                 bot.send_message(chat_id, "Digite o *nome* da nova instância (sem espaços):")
                 bot.register_next_step_handler(call.message, _passo_criar_instancia)
 
             elif data == "menu:status":
-                instancias = db.listar_instancias()
+                instancias = db.listar_instancias(None if admin else user_chat_id)
                 if not instancias:
                     texto = "Nenhuma instância cadastrada."
                 else:
@@ -285,27 +423,39 @@ def _registrar_handlers():
                         s = db.get_stats(inst["name"])
                         emoji = "🟢" if inst["ativo"] else "🔴"
                         linhas.append(f"{emoji} *{inst['name']}* — ✅ {s['sucesso']} | ❌ {s['falha']}")
-                    texto = "📊 *Status geral*\n──────────────────\n" + "\n".join(linhas)
+                    texto = "📊 *Status*\n──────────────────\n" + "\n".join(linhas)
                 kb = types.InlineKeyboardMarkup()
                 kb.add(types.InlineKeyboardButton("🔙 Voltar", callback_data="menu:main"))
                 _safe_edit(texto, chat_id, call.message.message_id, reply_markup=kb)
 
-            elif data == "menu:admins":
-                admins = db.listar_admins()
-                texto = "👥 *Admins:*\n" + "\n".join(f"• `{a}`" for a in admins)
-                texto += "\n\nUse /admin\\_add ou /admin\\_rm para gerenciar."
+            elif data == "menu:users":
+                if not _check_admin(call):
+                    return
+                usuarios = db.listar_usuarios()
+                linhas = []
+                for u in usuarios:
+                    badge = "👑" if u["role"] == "admin" else "👤"
+                    nome  = u.get("name") or "—"
+                    linhas.append(f"{badge} `{u['chat_id']}` · {nome}")
+                texto = "👥 *Usuários*\n──────────────────\n" + "\n".join(linhas)
+                texto += (
+                    "\n\nComandos:\n"
+                    "/user\\_add `<chat_id>` `[admin|user]` `[nome]`\n"
+                    "/user\\_rm `<chat_id>`\n"
+                    "/promote `<chat_id>` · /demote `<chat_id>`"
+                )
                 kb = types.InlineKeyboardMarkup()
                 kb.add(types.InlineKeyboardButton("🔙 Voltar", callback_data="menu:main"))
                 _safe_edit(texto, chat_id, call.message.message_id, reply_markup=kb)
 
             elif data.startswith("inst:open:"):
                 name = data.split(":", 2)[2]
-                _safe_edit(_resumo_instancia(name), chat_id, call.message.message_id,
+                _safe_edit(_resumo_instancia(name, user_chat_id), chat_id, call.message.message_id,
                                       reply_markup=kb_instancia(name))
 
             elif data.startswith("inst:status:"):
                 name = data.split(":", 2)[2]
-                _safe_edit(_resumo_instancia(name), chat_id, call.message.message_id,
+                _safe_edit(_resumo_instancia(name, user_chat_id), chat_id, call.message.message_id,
                                       reply_markup=kb_instancia(name))
 
             elif data.startswith("inst:toggle:"):
@@ -324,7 +474,7 @@ def _registrar_handlers():
                 db.set_ativo(name, not inst["ativo"])
                 bot.answer_callback_query(call.id,
                     "Ligado!" if not inst["ativo"] else "Desligado.")
-                _safe_edit(_resumo_instancia(name), chat_id, call.message.message_id,
+                _safe_edit(_resumo_instancia(name, user_chat_id), chat_id, call.message.message_id,
                                       reply_markup=kb_instancia(name))
 
             elif data.startswith("inst:groups:"):
@@ -339,7 +489,7 @@ def _registrar_handlers():
                     return
                 db.atualizar_instancia(name, target_group_jid=jid)
                 bot.answer_callback_query(call.id, "Grupo atualizado.")
-                _safe_edit(_resumo_instancia(name), chat_id, call.message.message_id,
+                _safe_edit(_resumo_instancia(name, user_chat_id), chat_id, call.message.message_id,
                                       reply_markup=kb_instancia(name))
 
             elif data.startswith("inst:name:"):
@@ -378,7 +528,7 @@ def _registrar_handlers():
 
             elif data.startswith("inst:donename:"):
                 name = data.split(":", 2)[2]
-                _safe_edit(_resumo_instancia(name), chat_id, call.message.message_id,
+                _safe_edit(_resumo_instancia(name, user_chat_id), chat_id, call.message.message_id,
                                       reply_markup=kb_instancia(name))
 
             elif data.startswith("inst:emoji:"):
@@ -395,7 +545,7 @@ def _registrar_handlers():
                 name = data.split(":", 2)[2]
                 ok, msg = _configurar_webhook_evolution(name)
                 _safe_answer(call.id, msg, show_alert=not ok)
-                _safe_edit(_resumo_instancia(name), chat_id, call.message.message_id,
+                _safe_edit(_resumo_instancia(name, user_chat_id), chat_id, call.message.message_id,
                                       reply_markup=kb_instancia(name))
 
             elif data.startswith("inst:del:"):
@@ -432,6 +582,15 @@ def _registrar_handlers():
 
 def _passo_criar_instancia(message):
     if not _check(message): return
+    user_chat_id = message.from_user.id
+    admin = db.is_admin(user_chat_id)
+
+    # Limite para usuários comuns
+    if not admin and db.contar_instancias_do_dono(user_chat_id) >= 1:
+        bot.reply_to(message,
+            "Você já tem 1 instância. Remova-a no menu antes de criar outra.")
+        return
+
     nome = (message.text or "").strip()
     if not nome or " " in nome:
         bot.reply_to(message, "Nome inválido. Use letras/números/underscore, sem espaços.")
@@ -448,7 +607,7 @@ def _passo_criar_instancia(message):
         bot.send_message(message.chat.id, f"❌ Erro ao criar: `{e}`")
         return
 
-    db.criar_instancia(nome)
+    db.criar_instancia(nome, owner_chat_id=user_chat_id)
 
     # Configura webhook ANTES de mostrar o QR — sem ele, a Evolution
     # nunca avisa nosso bot quando chegam mensagens.
@@ -465,6 +624,7 @@ def _passo_criar_instancia(message):
         f"✅ Instância `{nome}` criada.\n"
         f"Agora abra o menu da instância para configurar o *grupo* e o *nome alvo*.",
         reply_markup=kb_instancia(nome))
+    log.info(f"📦 instância '{nome}' criada por chat_id={user_chat_id}")
 
 
 def _passo_set_emoji(message):

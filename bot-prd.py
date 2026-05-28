@@ -175,7 +175,7 @@ def _verificar_uma_vez(instance_name: str, group_jid: str, msg_id: str,
         db.incrementar_falha(instance_name)
         prefixo = "⚠️ *Não fomos o primeiro.*\nInstância desligada automaticamente."
 
-    telegram_handlers.notificar_admins_com_menu_instancia(instance_name, prefixo=prefixo)
+    telegram_handlers.notificar_dono_com_menu_instancia(instance_name, prefixo=prefixo)
 
     with em_processamento_lock:
         em_processamento.discard(msg_id)
