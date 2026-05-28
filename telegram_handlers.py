@@ -33,6 +33,23 @@ WEBHOOK_URL    = os.getenv("WEBHOOK_URL", "").rstrip("/")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML") if TELEGRAM_TOKEN else None
 
+# Defesa em profundidade: força parse_mode=HTML em todos os métodos de envio,
+# mesmo que o default do construtor não esteja sendo respeitado por algum
+# motivo (cache de imagem, versão antiga do telebot, etc.).
+if bot is not None:
+    bot.parse_mode = "HTML"
+    for _m in ("send_message", "reply_to", "send_photo", "edit_message_text",
+              "edit_message_caption"):
+        _orig = getattr(bot, _m, None)
+        if _orig is None:
+            continue
+        def _wrap(orig):
+            def _f(*a, **kw):
+                kw.setdefault("parse_mode", "HTML")
+                return orig(*a, **kw)
+            return _f
+        setattr(bot, _m, _wrap(_orig))
+
 
 def _h(text) -> str:
     """Escapa conteúdo dinâmico para HTML (<, >, &)."""
@@ -92,7 +109,9 @@ def _safe_edit(text: str, chat_id: int, message_id: int,
                reply_markup: types.InlineKeyboardMarkup | None = None):
     """edit_message_text que ignora o erro 'message is not modified'."""
     try:
-        bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
+        bot.edit_message_text(text, chat_id, message_id,
+                              parse_mode="HTML",
+                              reply_markup=reply_markup)
     except ApiTelegramException as e:
         if "message is not modified" in str(e):
             return
@@ -278,8 +297,8 @@ def _registrar_handlers():
             texto += (
                 "\n<b>Admin:</b>\n"
                 "/users — listar usuários\n"
-                "/user_add <code>&lt;chat_id&gt;</code> <code>[nome]</code> — cria um user comum\n"
-                "/user_rm <code>&lt;chat_id&gt;</code> — remove um user comum\n"
+                "/user_add [chat_id] [nome] — cria um user comum\n"
+                "/user_rm [chat_id] — remove um user comum\n"
                 "\n<i>Admins são gerenciados apenas via ADMIN_CHAT_IDS no .env.</i>"
             )
         bot.reply_to(message, texto)
@@ -306,7 +325,7 @@ def _registrar_handlers():
         if not _check_admin(message): return
         parts = message.text.split(maxsplit=2)
         if len(parts) < 2:
-            bot.reply_to(message, "Uso: /user_add <code>&lt;chat_id&gt;</code> <code>[nome]</code>")
+            bot.reply_to(message, "Uso: /user_add [chat_id] [nome]")
             return
         try:
             chat_id = int(parts[1])
@@ -327,7 +346,7 @@ def _registrar_handlers():
         if not _check_admin(message): return
         parts = message.text.split()
         if len(parts) < 2:
-            bot.reply_to(message, "Uso: /user_rm <code>&lt;chat_id&gt;</code>")
+            bot.reply_to(message, "Uso: /user_rm [chat_id]")
             return
         try:
             chat_id = int(parts[1])
@@ -412,8 +431,8 @@ def _registrar_handlers():
                 texto = "👥 <b>Usuários</b>\n──────────────────\n" + "\n".join(linhas)
                 texto += (
                     "\n\nComandos:\n"
-                    "/user_add <code>&lt;chat_id&gt;</code> <code>[nome]</code>\n"
-                    "/user_rm <code>&lt;chat_id&gt;</code>\n"
+                    "/user_add [chat_id] [nome]\n"
+                    "/user_rm [chat_id]\n"
                     "\n<i>Admins: só via ADMIN_CHAT_IDS no .env.</i>"
                 )
                 kb = types.InlineKeyboardMarkup()
