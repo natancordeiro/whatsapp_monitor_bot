@@ -12,6 +12,7 @@ qualquer chat_id em ADMIN_CHAT_IDS (env) é injetado no init.
 """
 
 import os
+import html
 import base64
 import logging
 import threading
@@ -30,7 +31,12 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 WEBHOOK_URL    = os.getenv("WEBHOOK_URL", "").rstrip("/")
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown") if TELEGRAM_TOKEN else None
+bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML") if TELEGRAM_TOKEN else None
+
+
+def _h(text) -> str:
+    """Escapa conteúdo dinâmico para HTML (<, >, &)."""
+    return html.escape("" if text is None else str(text), quote=False)
 
 # Cache em memória para mapeamentos curtos por chat (callbacks têm 64 bytes)
 # Estrutura: { chat_id: { "groups": {idx: jid_completo}, "inst_em_config": str } }
@@ -204,36 +210,37 @@ def kb_instancia(name: str) -> types.InlineKeyboardMarkup:
 def _resumo_instancia(name: str, viewer_chat_id: int | None = None) -> str:
     inst = db.get_instancia(name)
     if not inst:
-        return f"❌ Instância `{name}` não existe."
+        return f"❌ Instância <code>{_h(name)}</code> não existe."
     s = db.get_stats(name)
     estado = "🟢 ATIVA" if inst["ativo"] else "🔴 PARADA"
-    captura = s["ultima_captura"] or "nenhuma"
+    captura = _h(s["ultima_captura"] or "nenhuma")
     nomes = db.parse_target_names(inst["target_name"])
     if not nomes:
         alvos_str = "—"
     elif len(nomes) <= 3:
-        alvos_str = ", ".join(nomes)
+        alvos_str = _h(", ".join(nomes))
     else:
-        alvos_str = f"{', '.join(nomes[:3])}  _(+{len(nomes) - 3})_"
+        alvos_str = f"{_h(', '.join(nomes[:3]))}  <i>(+{len(nomes) - 3})</i>"
 
-    # Mostra dono se o viewer é admin E o dono não é ele mesmo
     linha_dono = ""
     if viewer_chat_id and db.is_admin(viewer_chat_id):
         owner = inst.get("owner_chat_id")
         if owner and owner != viewer_chat_id:
             dono = db.get_usuario(owner) or {}
             nome_dono = dono.get("name") or str(owner)
-            linha_dono = f"*Dono:* `{nome_dono}`\n"
+            linha_dono = f"<b>Dono:</b> <code>{_h(nome_dono)}</code>\n"
 
+    grupo  = (inst['target_group_jid'] or '—')[-25:]
+    emoji  = _h(inst['emoji'])
     return (
-        f"📱 *{name}* — {estado}\n"
+        f"📱 <b>{_h(name)}</b> — {estado}\n"
         f"──────────────────\n"
         f"{linha_dono}"
-        f"*Grupo:* `{(inst['target_group_jid'] or '—')[-25:]}`\n"
-        f"*Alvos ({len(nomes)}):* {alvos_str}\n"
-        f"*Emoji:* {inst['emoji']}\n"
-        f"*Sucessos:* {s['sucesso']} | *Falhas:* {s['falha']}\n"
-        f"*Última captura:* {captura}"
+        f"<b>Grupo:</b> <code>{_h(grupo)}</code>\n"
+        f"<b>Alvos ({len(nomes)}):</b> {alvos_str}\n"
+        f"<b>Emoji:</b> {emoji}\n"
+        f"<b>Sucessos:</b> {s['sucesso']} | <b>Falhas:</b> {s['falha']}\n"
+        f"<b>Última captura:</b> {captura}"
     )
 
 
@@ -250,30 +257,30 @@ def _registrar_handlers():
         if not _check(message): return
         bot.send_message(
             message.chat.id,
-            "🤖 *WhatsApp Monitor Bot*\nEscolha uma opção:",
+            "🤖 <b>WhatsApp Monitor Bot</b>\nEscolha uma opção:",
             reply_markup=kb_main(message.from_user.id)
         )
 
     @bot.message_handler(commands=["meuid"])
     def cmd_meuid(message):
-        bot.reply_to(message, f"Seu chat_id: `{message.from_user.id}`")
+        bot.reply_to(message, f"Seu chat_id: <code>{message.from_user.id}</code>")
 
     @bot.message_handler(commands=["ajuda", "help"])
     def cmd_ajuda(message):
         if not _check(message): return
         admin = db.is_admin(message.from_user.id)
         texto = (
-            "*Comandos:*\n"
+            "<b>Comandos:</b>\n"
             "/menu — abrir menu principal\n"
-            "/meuid — ver seu chat\\_id\n"
+            "/meuid — ver seu chat_id\n"
         )
         if admin:
             texto += (
-                "\n*Admin:*\n"
+                "\n<b>Admin:</b>\n"
                 "/users — listar usuários\n"
-                "/user\\_add `<chat_id>` `[nome]` — cria um user comum\n"
-                "/user\\_rm `<chat_id>` — remove um user comum\n"
-                "\n_Admins são gerenciados apenas via `ADMIN\\_CHAT\\_IDS` no .env._"
+                "/user_add <code>&lt;chat_id&gt;</code> <code>[nome]</code> — cria um user comum\n"
+                "/user_rm <code>&lt;chat_id&gt;</code> — remove um user comum\n"
+                "\n<i>Admins são gerenciados apenas via ADMIN_CHAT_IDS no .env.</i>"
             )
         bot.reply_to(message, texto)
 
@@ -289,54 +296,51 @@ def _registrar_handlers():
         linhas = []
         for u in usuarios:
             badge = "👑" if u["role"] == "admin" else "👤"
-            nome  = u.get("name") or "—"
+            nome  = _h(u.get("name") or "—")
             n_inst = db.contar_instancias_do_dono(u["chat_id"])
-            linhas.append(f"{badge} `{u['chat_id']}` · {nome} · {n_inst} inst.")
-        bot.reply_to(message, "👥 *Usuários*\n" + "\n".join(linhas))
+            linhas.append(f"{badge} <code>{u['chat_id']}</code> · {nome} · {n_inst} inst.")
+        bot.reply_to(message, "👥 <b>Usuários</b>\n" + "\n".join(linhas))
 
     @bot.message_handler(commands=["user_add"])
     def cmd_user_add(message):
-        """Cria um user comum. Admins só podem ser cadastrados via .env."""
         if not _check_admin(message): return
         parts = message.text.split(maxsplit=2)
         if len(parts) < 2:
-            bot.reply_to(message, "Uso: /user\\_add `<chat_id>` `[nome]`")
+            bot.reply_to(message, "Uso: /user_add <code>&lt;chat_id&gt;</code> <code>[nome]</code>")
             return
         try:
             chat_id = int(parts[1])
         except ValueError:
-            bot.reply_to(message, "chat\\_id inválido.")
+            bot.reply_to(message, "chat_id inválido.")
             return
-        # Se o chat_id já é admin (vindo do .env), não permite "rebaixar" via comando
         if db.is_admin(chat_id):
             bot.reply_to(message,
-                "⚠️ Esse chat\\_id já é admin (.env). Remova do `ADMIN_CHAT_IDS` "
-                "se quiser virar user comum.")
+                "⚠️ Esse chat_id já é admin (.env). Remova do "
+                "<code>ADMIN_CHAT_IDS</code> se quiser virar user comum.")
             return
         nome = parts[2] if len(parts) > 2 else None
         db.adicionar_usuario(chat_id, role="user", name=nome)
-        bot.reply_to(message, f"✅ User `{chat_id}` cadastrado.")
+        bot.reply_to(message, f"✅ User <code>{chat_id}</code> cadastrado.")
 
     @bot.message_handler(commands=["user_rm"])
     def cmd_user_rm(message):
-        """Remove um user comum. Admin não pode ser removido por comando."""
         if not _check_admin(message): return
         parts = message.text.split()
         if len(parts) < 2:
-            bot.reply_to(message, "Uso: /user\\_rm `<chat_id>`")
+            bot.reply_to(message, "Uso: /user_rm <code>&lt;chat_id&gt;</code>")
             return
         try:
             chat_id = int(parts[1])
         except ValueError:
-            bot.reply_to(message, "chat\\_id inválido.")
+            bot.reply_to(message, "chat_id inválido.")
             return
         if db.is_admin(chat_id):
             bot.reply_to(message,
                 "⚠️ Não posso remover um admin. "
-                "Tire o chat\\_id de `ADMIN_CHAT_IDS` no .env e reinicie o bot.")
+                "Tire o chat_id de <code>ADMIN_CHAT_IDS</code> no .env e reinicie o bot.")
             return
         db.remover_usuario(chat_id)
-        bot.reply_to(message, f"✅ User `{chat_id}` removido.")
+        bot.reply_to(message, f"✅ User <code>{chat_id}</code> removido.")
 
     # ── Callbacks (inline keyboard) ───────────────────────────
 
@@ -359,24 +363,23 @@ def _registrar_handlers():
 
         try:
             if data == "menu:main":
-                _safe_edit("🤖 *WhatsApp Monitor Bot*\nEscolha uma opção:",
+                _safe_edit("🤖 <b>WhatsApp Monitor Bot</b>\nEscolha uma opção:",
                                       chat_id, call.message.message_id,
                                       reply_markup=kb_main(user_chat_id))
 
             elif data == "menu:list_inst":
                 instancias = db.listar_instancias(None if admin else user_chat_id)
-                texto = "📱 *Instâncias cadastradas:*" if instancias else "Nenhuma instância ainda."
+                texto = "📱 <b>Instâncias cadastradas:</b>" if instancias else "Nenhuma instância ainda."
                 _safe_edit(texto, chat_id, call.message.message_id,
                                       reply_markup=kb_lista_instancias(user_chat_id))
 
             elif data == "menu:create_inst":
-                # Limite para usuários comuns
                 if not admin and db.contar_instancias_do_dono(user_chat_id) >= 1:
                     _safe_answer(call.id,
                         "Você já tem 1 instância. Remova-a antes de criar outra.",
                         show_alert=True)
                     return
-                bot.send_message(chat_id, "Digite o *nome* da nova instância (sem espaços):")
+                bot.send_message(chat_id, "Digite o <b>nome</b> da nova instância (sem espaços):")
                 bot.register_next_step_handler(call.message, _passo_criar_instancia)
 
             elif data == "menu:status":
@@ -388,8 +391,11 @@ def _registrar_handlers():
                     for inst in instancias:
                         s = db.get_stats(inst["name"])
                         emoji = "🟢" if inst["ativo"] else "🔴"
-                        linhas.append(f"{emoji} *{inst['name']}* — ✅ {s['sucesso']} | ❌ {s['falha']}")
-                    texto = "📊 *Status*\n──────────────────\n" + "\n".join(linhas)
+                        linhas.append(
+                            f"{emoji} <b>{_h(inst['name'])}</b> — "
+                            f"✅ {s['sucesso']} | ❌ {s['falha']}"
+                        )
+                    texto = "📊 <b>Status</b>\n──────────────────\n" + "\n".join(linhas)
                 kb = types.InlineKeyboardMarkup()
                 kb.add(types.InlineKeyboardButton("🔙 Voltar", callback_data="menu:main"))
                 _safe_edit(texto, chat_id, call.message.message_id, reply_markup=kb)
@@ -401,14 +407,14 @@ def _registrar_handlers():
                 linhas = []
                 for u in usuarios:
                     badge = "👑" if u["role"] == "admin" else "👤"
-                    nome  = u.get("name") or "—"
-                    linhas.append(f"{badge} `{u['chat_id']}` · {nome}")
-                texto = "👥 *Usuários*\n──────────────────\n" + "\n".join(linhas)
+                    nome  = _h(u.get("name") or "—")
+                    linhas.append(f"{badge} <code>{u['chat_id']}</code> · {nome}")
+                texto = "👥 <b>Usuários</b>\n──────────────────\n" + "\n".join(linhas)
                 texto += (
                     "\n\nComandos:\n"
-                    "/user\\_add `<chat_id>` `[nome]`\n"
-                    "/user\\_rm `<chat_id>`\n"
-                    "\n_Admins: só via `ADMIN\\_CHAT\\_IDS` no .env._"
+                    "/user_add <code>&lt;chat_id&gt;</code> <code>[nome]</code>\n"
+                    "/user_rm <code>&lt;chat_id&gt;</code>\n"
+                    "\n<i>Admins: só via ADMIN_CHAT_IDS no .env.</i>"
                 )
                 kb = types.InlineKeyboardMarkup()
                 kb.add(types.InlineKeyboardButton("🔙 Voltar", callback_data="menu:main"))
@@ -500,7 +506,8 @@ def _registrar_handlers():
             elif data.startswith("inst:emoji:"):
                 name = data.split(":", 2)[2]
                 _state(chat_id)["inst_em_config"] = name
-                bot.send_message(chat_id, f"Digite o *novo emoji* para `{name}`:")
+                bot.send_message(chat_id,
+                    f"Digite o <b>novo emoji</b> para <code>{_h(name)}</code>:")
                 bot.register_next_step_handler(call.message, _passo_set_emoji)
 
             elif data.startswith("inst:qr:"):
@@ -515,7 +522,7 @@ def _registrar_handlers():
                     types.InlineKeyboardButton("Cancelar",        callback_data=f"inst:open:{name}"),
                 )
                 _safe_edit(
-                    f"⚠️ Remover instância `{name}` da Evolution e do banco?",
+                    f"⚠️ Remover instância <code>{_h(name)}</code> da Evolution e do banco?",
                     chat_id, call.message.message_id, reply_markup=kb
                 )
 
@@ -526,7 +533,7 @@ def _registrar_handlers():
                 except Exception as e:
                     log.warning(f"Falha ao deletar na Evolution: {e}")
                 db.remover_instancia(name)
-                _safe_edit(f"🗑️ Instância `{name}` removida.",
+                _safe_edit(f"🗑️ Instância <code>{_h(name)}</code> removida.",
                                       chat_id, call.message.message_id,
                                       reply_markup=kb_main())
 
@@ -556,32 +563,30 @@ def _passo_criar_instancia(message):
         return
 
     if db.get_instancia(nome):
-        bot.reply_to(message, f"Já existe uma instância com nome `{nome}`.")
+        bot.reply_to(message, f"Já existe uma instância com nome <code>{_h(nome)}</code>.")
         return
 
-    bot.reply_to(message, f"⏳ Criando instância `{nome}` na Evolution...")
+    bot.reply_to(message, f"⏳ Criando instância <code>{_h(nome)}</code> na Evolution...")
     try:
         evolution.criar_instancia(nome)
     except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Erro ao criar: `{e}`")
+        bot.send_message(message.chat.id, f"❌ Erro ao criar: <code>{_h(e)}</code>")
         return
 
     db.criar_instancia(nome, owner_chat_id=user_chat_id)
 
-    # Configura webhook ANTES de mostrar o QR — sem ele, a Evolution
-    # nunca avisa nosso bot quando chegam mensagens.
+    # Configura webhook ANTES do QR — sem ele a Evolution não nos chama.
     ok, msg = _configurar_webhook_evolution(nome)
     if ok:
-        bot.send_message(message.chat.id, f"🔗 {msg}")
+        bot.send_message(message.chat.id, f"🔗 {_h(msg)}")
     else:
         bot.send_message(message.chat.id,
-            f"⚠️ *Webhook não foi configurado:* {msg}\n"
-            f"Use o botão '🔗 Reconfigurar webhook' no menu depois.")
+            f"⚠️ <b>Webhook não foi configurado:</b> {_h(msg)}")
 
     _enviar_qr(message.chat.id, nome)
     bot.send_message(message.chat.id,
-        f"✅ Instância `{nome}` criada.\n"
-        f"Agora abra o menu da instância para configurar o *grupo* e o *nome alvo*.",
+        f"✅ Instância <code>{_h(nome)}</code> criada.\n"
+        f"Agora abra o menu da instância para configurar o <b>grupo</b> e o <b>nome alvo</b>.",
         reply_markup=kb_instancia(nome))
     log.info(f"📦 instância '{nome}' criada por chat_id={user_chat_id}")
 
@@ -597,7 +602,7 @@ def _passo_set_emoji(message):
         bot.reply_to(message, "Emoji vazio.")
         return
     db.atualizar_instancia(nome_inst, emoji=valor)
-    bot.reply_to(message, f"✅ Emoji atualizado: {valor}",
+    bot.reply_to(message, f"✅ Emoji atualizado: {_h(valor)}",
                  reply_markup=kb_instancia(nome_inst))
 
 
@@ -625,18 +630,19 @@ def _configurar_webhook_evolution(instance_name: str) -> tuple[bool, str]:
 
 def _enviar_qr(chat_id: int, instance_name: str):
     """Conecta a instância e envia o QR Code como foto."""
-    bot.send_message(chat_id, f"⏳ Gerando QR Code para `{instance_name}`...")
+    bot.send_message(chat_id,
+        f"⏳ Gerando QR Code para <code>{_h(instance_name)}</code>...")
     try:
         resp = evolution.conectar_instancia(instance_name)
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Erro ao conectar: `{e}`")
+        bot.send_message(chat_id, f"❌ Erro ao conectar: <code>{_h(e)}</code>")
         return
 
     b64 = resp.get("base64") or resp.get("data", {}).get("base64") or resp.get("qrcode", {}).get("base64")
     if not b64:
         bot.send_message(chat_id,
             "⚠️ Resposta sem QR. A instância pode já estar conectada.\n"
-            f"```\n{str(resp)[:300]}\n```")
+            f"<pre>{_h(str(resp)[:300])}</pre>")
         return
 
     if "," in b64:
@@ -644,12 +650,12 @@ def _enviar_qr(chat_id: int, instance_name: str):
     try:
         img = base64.b64decode(b64)
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Base64 inválido: {e}")
+        bot.send_message(chat_id, f"❌ Base64 inválido: {_h(e)}")
         return
 
     bot.send_photo(
         chat_id, BytesIO(img),
-        caption=(f"📱 *QR Code — `{instance_name}`*\n\n"
+        caption=(f"📱 <b>QR Code — <code>{_h(instance_name)}</code></b>\n\n"
                  f"Escaneie no WhatsApp em até 60s.\n"
                  f"⚠️ Após conectar, configure o grupo e o nome alvo no menu.")
     )
@@ -743,9 +749,10 @@ def _renderizar_pagina_participantes(chat_id: int, message_id: int,
     kb.add(types.InlineKeyboardButton("✅ Concluir", callback_data=f"inst:donename:{instance_name}"))
 
     _safe_edit(
-        f"👤 *Toque para marcar/desmarcar* os alvos de `{instance_name}`:\n"
-        f"_{len(selecionados)} selecionado(s) · {total} pessoas no grupo · "
-        f"mostrando {inicio + 1}-{fim}._",
+        f"👤 <b>Toque para marcar/desmarcar</b> os alvos de "
+        f"<code>{_h(instance_name)}</code>:\n"
+        f"<i>{len(selecionados)} selecionado(s) · {total} pessoas no grupo · "
+        f"mostrando {inicio + 1}-{fim}.</i>",
         chat_id, message_id, reply_markup=kb
     )
 
@@ -818,8 +825,8 @@ def _listar_grupos_para_escolha(chat_id: int, message_id: int, instance_name: st
     try:
         grupos = evolution.listar_grupos(instance_name, get_participants=False)
     except Exception as e:
-        bot.edit_message_text(f"❌ Erro ao listar grupos: `{e}`", chat_id, message_id,
-                              reply_markup=kb_instancia(instance_name))
+        _safe_edit(f"❌ Erro ao listar grupos: <code>{_h(e)}</code>",
+                   chat_id, message_id, reply_markup=kb_instancia(instance_name))
         return
 
     if not grupos:
@@ -844,8 +851,8 @@ def _listar_grupos_para_escolha(chat_id: int, message_id: int, instance_name: st
     _state(chat_id)["groups"] = mapa
     kb.add(types.InlineKeyboardButton("🔙 Voltar", callback_data=f"inst:open:{instance_name}"))
 
-    bot.edit_message_text(
-        f"👥 *Selecione o grupo alvo* para `{instance_name}`:",
+    _safe_edit(
+        f"👥 <b>Selecione o grupo alvo</b> para <code>{_h(instance_name)}</code>:",
         chat_id, message_id, reply_markup=kb
     )
 
@@ -860,5 +867,5 @@ def iniciar_polling():
         return
     _registrar_handlers()
     log.info("📱 Telegram bot iniciado. Polling ativo.")
-    notificar_admins("🤖 *Bot iniciado!* Use /menu para começar.")
+    notificar_admins("🤖 <b>Bot iniciado!</b> Use /menu para começar.")
     bot.infinity_polling(timeout=30, long_polling_timeout=20)

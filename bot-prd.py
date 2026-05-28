@@ -18,6 +18,7 @@
 """
 
 import os
+import html
 import time
 import logging
 import threading
@@ -169,11 +170,11 @@ def _verificar_uma_vez(instance_name: str, group_jid: str, msg_id: str,
     if fomos_primeiro:
         log.info(f"🏆 [{instance_name}] FOMOS OS PRIMEIROS!")
         db.incrementar_sucesso(instance_name, datetime.now().isoformat(timespec="seconds"))
-        prefixo = "🏆 *FOMOS OS PRIMEIROS!*\nInstância desligada automaticamente."
+        prefixo = "🏆 <b>FOMOS OS PRIMEIROS!</b>\nInstância desligada automaticamente."
     else:
         log.warning(f"[{instance_name}] não fomos o primeiro — desligando.")
         db.incrementar_falha(instance_name)
-        prefixo = "⚠️ *Não fomos o primeiro.*\nInstância desligada automaticamente."
+        prefixo = "⚠️ <b>Não fomos o primeiro.</b>\nInstância desligada automaticamente."
 
     telegram_handlers.notificar_dono_com_menu_instancia(instance_name, prefixo=prefixo)
 
@@ -235,7 +236,8 @@ def _pos_envio(instance_name: str, inst: dict, group_jid: str, msg_id: str,
         log.warning(f"incrementar_tentativa: {e}")
 
     telegram_handlers.notificar_admins(
-        f"🎯 *[{instance_name}]* alvo detectado!\n`{texto[:120]}`"
+        f"🎯 <b>[{html.escape(instance_name)}]</b> alvo detectado!\n"
+        f"<code>{html.escape(texto[:120])}</code>"
     )
 
     if not nosso_id:
