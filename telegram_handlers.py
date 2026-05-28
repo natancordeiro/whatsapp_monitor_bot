@@ -97,6 +97,23 @@ def notificar_admins(texto: str):
         notificar(chat_id, texto)
 
 
+def notificar_admins_com_menu_instancia(instance_name: str, prefixo: str = ""):
+    """Manda pros admins o resumo da instância + teclado inline (mesmo do menu)."""
+    if not bot:
+        return
+
+    def _send():
+        texto = (f"{prefixo}\n\n" if prefixo else "") + _resumo_instancia(instance_name)
+        markup = kb_instancia(instance_name)
+        for chat_id in db.listar_admins():
+            try:
+                bot.send_message(chat_id, texto, reply_markup=markup)
+            except Exception as e:
+                log.warning(f"Telegram send error ({chat_id}): {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
 # ─────────────────────────────────────────────────────────────
 # Menus (InlineKeyboardMarkup)
 # ─────────────────────────────────────────────────────────────

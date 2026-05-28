@@ -149,55 +149,32 @@ def _verificar_se_primeiro(instance_name: str, group_jid: str,
     return citacoes[0].get("key", {}).get("id", "") == nosso_msg_id
 
 
-def _verificar_e_retry(instance_name: str, group_jid: str, msg_id: str,
-                        participant: str, texto: str, emoji: str,
-                        nosso_msg_id: str, tentativa: int, max_retries: int,
-                        check_delay: float):
+def _verificar_uma_vez(instance_name: str, group_jid: str, msg_id: str,
+                         nosso_msg_id: str, check_delay: float):
+    """
+    Após o envio, espera `check_delay`, confere se fomos o primeiro a citar e
+    DESLIGA a instância em ambos os casos (sucesso ou fracasso). Sem retry.
+    """
     time.sleep(check_delay)
 
-    if _verificar_se_primeiro(instance_name, group_jid, msg_id, nosso_msg_id):
-        log.info(f"🏆 [{instance_name}] FOMOS OS PRIMEIROS! (tentativa {tentativa})")
+    fomos_primeiro = _verificar_se_primeiro(instance_name, group_jid, msg_id, nosso_msg_id)
+
+    # Auto-stop em qualquer cenário — o cliente religa quando quiser.
+    db.set_ativo(instance_name, False)
+
+    if fomos_primeiro:
+        log.info(f"🏆 [{instance_name}] FOMOS OS PRIMEIROS!")
         db.incrementar_sucesso(instance_name, datetime.now().isoformat(timespec="seconds"))
-        db.set_ativo(instance_name, False)
-        telegram_handlers.notificar_admins(
-            f"🏆 *[{instance_name}]* FOMOS OS PRIMEIROS!\n"
-            f"Instância desligada automaticamente."
-        )
-        with em_processamento_lock:
-            em_processamento.discard(msg_id)
-        return
+        prefixo = "🏆 *FOMOS OS PRIMEIROS!*\nInstância desligada automaticamente."
+    else:
+        log.warning(f"[{instance_name}] não fomos o primeiro — desligando.")
+        db.incrementar_falha(instance_name)
+        prefixo = "⚠️ *Não fomos o primeiro.*\nInstância desligada automaticamente."
 
-    db.incrementar_falha(instance_name)
+    telegram_handlers.notificar_admins_com_menu_instancia(instance_name, prefixo=prefixo)
 
-    if tentativa >= max_retries:
-        log.warning(f"[{instance_name}] limite de {max_retries} tentativas atingido.")
-        telegram_handlers.notificar_admins(
-            f"⚠️ *[{instance_name}]* não consegui ser o primeiro após {max_retries} tentativas."
-        )
-        with em_processamento_lock:
-            em_processamento.discard(msg_id)
-        return
-
-    log.info(f"[{instance_name}] reenvio tentativa {tentativa + 1}/{max_retries}")
-    try:
-        nova = evolution.enviar_emoji_citando(instance_name, group_jid, msg_id,
-                                              participant, texto, emoji)
-        db.incrementar_tentativa(instance_name)
-    except Exception as e:
-        log.error(f"[{instance_name}] erro no reenvio: {e}")
-        with em_processamento_lock:
-            em_processamento.discard(msg_id)
-        return
-
-    novo_id = nova.get("key", {}).get("id", "")
-    if not novo_id:
-        with em_processamento_lock:
-            em_processamento.discard(msg_id)
-        return
-
-    executor.submit(_verificar_e_retry, instance_name, group_jid, msg_id,
-                    participant, texto, emoji, novo_id, tentativa + 1,
-                    max_retries, check_delay)
+    with em_processamento_lock:
+        em_processamento.discard(msg_id)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -242,11 +219,11 @@ def _enviar_imediato(instance_name: str, inst: dict, msg_data: dict, t_webhook: 
 
     # ── Pós-envio (sem afetar o tempo de resposta) ──────────
     executor.submit(_pos_envio, instance_name, inst, group_jid, msg_id,
-                    participant, texto, emoji, nosso_id)
+                    texto, nosso_id)
 
 
 def _pos_envio(instance_name: str, inst: dict, group_jid: str, msg_id: str,
-                participant: str, texto: str, emoji: str, nosso_id: str):
+                texto: str, nosso_id: str):
     """Tudo que pode esperar: telemetria, telegram, verificação."""
     try:
         db.incrementar_tentativa(instance_name)
@@ -263,9 +240,8 @@ def _pos_envio(instance_name: str, inst: dict, group_jid: str, msg_id: str,
             em_processamento.discard(msg_id)
         return
 
-    executor.submit(_verificar_e_retry, instance_name, group_jid, msg_id,
-                    participant, texto, emoji, nosso_id, 1,
-                    inst["max_retries"], inst["check_delay"])
+    executor.submit(_verificar_uma_vez, instance_name, group_jid, msg_id,
+                    nosso_id, inst["check_delay"])
 
 
 # ═════════════════════════════════════════════════════════════
