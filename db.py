@@ -104,13 +104,25 @@ def init_db(seed_admins: list[int] | None = None):
         if "owner_chat_id" not in cols:
             c.execute("ALTER TABLE instances ADD COLUMN owner_chat_id INTEGER")
 
-        # Seed admins do .env (cria ou promove a admin)
+        # ── Admins vêm SÓ do .env (fonte de verdade) ──
+        # 1. Cria/promove a admin todo chat_id listado
         if seed_admins:
             for chat_id in seed_admins:
                 c.execute("""
                     INSERT INTO users (chat_id, role) VALUES (?, 'admin')
                     ON CONFLICT(chat_id) DO UPDATE SET role='admin'
                 """, (chat_id,))
+        # 2. Rebaixa pra 'user' qualquer admin no DB que não esteja mais no .env.
+        #    SE o .env estiver vazio, NÃO rebaixa ninguém (proteção contra
+        #    deploy acidental sem ADMIN_CHAT_IDS — não queremos trancar todo
+        #    mundo fora do sistema).
+        if seed_admins:
+            placeholders = ",".join("?" * len(seed_admins))
+            c.execute(
+                f"UPDATE users SET role='user' WHERE role='admin' "
+                f"AND chat_id NOT IN ({placeholders})",
+                tuple(seed_admins),
+            )
 
         # Adopta instâncias órfãs (sem dono) pro primeiro admin disponível
         c.execute("SELECT chat_id FROM users WHERE role='admin' ORDER BY chat_id LIMIT 1")

@@ -196,9 +196,6 @@ def kb_instancia(name: str) -> types.InlineKeyboardMarkup:
             types.InlineKeyboardButton("😀 Emoji",      callback_data=f"inst:emoji:{name}"),
             types.InlineKeyboardButton("🔄 QR Code",    callback_data=f"inst:qr:{name}"),
         )
-        kb.add(
-            types.InlineKeyboardButton("🔗 Reconfigurar webhook", callback_data=f"inst:hook:{name}"),
-        )
         kb.add(types.InlineKeyboardButton("🗑️ Remover", callback_data=f"inst:del:{name}"))
     kb.add(types.InlineKeyboardButton("🔙 Voltar", callback_data="menu:list_inst"))
     return kb
@@ -274,10 +271,9 @@ def _registrar_handlers():
             texto += (
                 "\n*Admin:*\n"
                 "/users — listar usuários\n"
-                "/user\\_add `<chat_id>` `[admin|user]` `[nome]`\n"
-                "/user\\_rm `<chat_id>`\n"
-                "/promote `<chat_id>` — tornar admin\n"
-                "/demote `<chat_id>` — rebaixar a user\n"
+                "/user\\_add `<chat_id>` `[nome]` — cria um user comum\n"
+                "/user\\_rm `<chat_id>` — remove um user comum\n"
+                "\n_Admins são gerenciados apenas via `ADMIN\\_CHAT\\_IDS` no .env._"
             )
         bot.reply_to(message, texto)
 
@@ -300,26 +296,30 @@ def _registrar_handlers():
 
     @bot.message_handler(commands=["user_add"])
     def cmd_user_add(message):
+        """Cria um user comum. Admins só podem ser cadastrados via .env."""
         if not _check_admin(message): return
-        parts = message.text.split(maxsplit=3)
+        parts = message.text.split(maxsplit=2)
         if len(parts) < 2:
-            bot.reply_to(message, "Uso: /user\\_add `<chat_id>` `[admin|user]` `[nome]`")
+            bot.reply_to(message, "Uso: /user\\_add `<chat_id>` `[nome]`")
             return
         try:
             chat_id = int(parts[1])
         except ValueError:
             bot.reply_to(message, "chat\\_id inválido.")
             return
-        role = parts[2] if len(parts) > 2 else "user"
-        if role not in ("admin", "user"):
-            bot.reply_to(message, "Role inválida (use `admin` ou `user`).")
+        # Se o chat_id já é admin (vindo do .env), não permite "rebaixar" via comando
+        if db.is_admin(chat_id):
+            bot.reply_to(message,
+                "⚠️ Esse chat\\_id já é admin (.env). Remova do `ADMIN_CHAT_IDS` "
+                "se quiser virar user comum.")
             return
-        nome = parts[3] if len(parts) > 3 else None
-        db.adicionar_usuario(chat_id, role=role, name=nome)
-        bot.reply_to(message, f"✅ Usuário `{chat_id}` ({role}) salvo.")
+        nome = parts[2] if len(parts) > 2 else None
+        db.adicionar_usuario(chat_id, role="user", name=nome)
+        bot.reply_to(message, f"✅ User `{chat_id}` cadastrado.")
 
     @bot.message_handler(commands=["user_rm"])
     def cmd_user_rm(message):
+        """Remove um user comum. Admin não pode ser removido por comando."""
         if not _check_admin(message): return
         parts = message.text.split()
         if len(parts) < 2:
@@ -330,47 +330,13 @@ def _registrar_handlers():
         except ValueError:
             bot.reply_to(message, "chat\\_id inválido.")
             return
-        if chat_id == message.from_user.id:
-            bot.reply_to(message, "⚠️ Você não pode remover a si mesmo.")
+        if db.is_admin(chat_id):
+            bot.reply_to(message,
+                "⚠️ Não posso remover um admin. "
+                "Tire o chat\\_id de `ADMIN_CHAT_IDS` no .env e reinicie o bot.")
             return
         db.remover_usuario(chat_id)
-        bot.reply_to(message, f"✅ Usuário `{chat_id}` removido.")
-
-    @bot.message_handler(commands=["promote"])
-    def cmd_promote(message):
-        if not _check_admin(message): return
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "Uso: /promote `<chat_id>`")
-            return
-        try:
-            chat_id = int(parts[1])
-        except ValueError:
-            bot.reply_to(message, "chat\\_id inválido.")
-            return
-        if not db.eh_usuario(chat_id):
-            bot.reply_to(message, "Usuário não cadastrado. Use /user\\_add primeiro.")
-            return
-        db.set_role(chat_id, "admin")
-        bot.reply_to(message, f"👑 `{chat_id}` agora é admin.")
-
-    @bot.message_handler(commands=["demote"])
-    def cmd_demote(message):
-        if not _check_admin(message): return
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "Uso: /demote `<chat_id>`")
-            return
-        try:
-            chat_id = int(parts[1])
-        except ValueError:
-            bot.reply_to(message, "chat\\_id inválido.")
-            return
-        if chat_id == message.from_user.id:
-            bot.reply_to(message, "⚠️ Você não pode rebaixar a si mesmo.")
-            return
-        db.set_role(chat_id, "user")
-        bot.reply_to(message, f"👤 `{chat_id}` agora é user comum.")
+        bot.reply_to(message, f"✅ User `{chat_id}` removido.")
 
     # ── Callbacks (inline keyboard) ───────────────────────────
 
@@ -440,9 +406,9 @@ def _registrar_handlers():
                 texto = "👥 *Usuários*\n──────────────────\n" + "\n".join(linhas)
                 texto += (
                     "\n\nComandos:\n"
-                    "/user\\_add `<chat_id>` `[admin|user]` `[nome]`\n"
+                    "/user\\_add `<chat_id>` `[nome]`\n"
                     "/user\\_rm `<chat_id>`\n"
-                    "/promote `<chat_id>` · /demote `<chat_id>`"
+                    "\n_Admins: só via `ADMIN\\_CHAT\\_IDS` no .env._"
                 )
                 kb = types.InlineKeyboardMarkup()
                 kb.add(types.InlineKeyboardButton("🔙 Voltar", callback_data="menu:main"))
@@ -540,13 +506,6 @@ def _registrar_handlers():
             elif data.startswith("inst:qr:"):
                 name = data.split(":", 2)[2]
                 _enviar_qr(chat_id, name)
-
-            elif data.startswith("inst:hook:"):
-                name = data.split(":", 2)[2]
-                ok, msg = _configurar_webhook_evolution(name)
-                _safe_answer(call.id, msg, show_alert=not ok)
-                _safe_edit(_resumo_instancia(name, user_chat_id), chat_id, call.message.message_id,
-                                      reply_markup=kb_instancia(name))
 
             elif data.startswith("inst:del:"):
                 name = data.split(":", 2)[2]
