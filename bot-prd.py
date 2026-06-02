@@ -239,7 +239,8 @@ def _pos_envio(instance_name: str, inst: dict, group_jid: str, msg_id: str,
     except Exception as e:
         log.warning(f"incrementar_tentativa: {e}")
 
-    telegram_handlers.notificar_admins(
+    telegram_handlers.notificar_alvo(
+        instance_name,
         f"🎯 <b>[{html.escape(instance_name)}]</b> alvo detectado!\n"
         f"<code>{html.escape(texto[:120])}</code>"
     )

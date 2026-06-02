@@ -144,6 +144,25 @@ def notificar_admins(texto: str):
         notificar(chat_id, texto)
 
 
+def notificar_alvo(instance_name: str, texto: str):
+    """
+    Notificação de 'alvo detectado'.
+    SEMPRE manda pro dono da instância.
+    Manda pra cada admin SOMENTE se o dono tiver notify_admins=1.
+    """
+    owner = db.get_owner(instance_name)
+    enviados: set[int] = set()
+    if owner:
+        notificar(owner, texto)
+        enviados.add(owner)
+
+    if owner and db.get_notify_admins(owner):
+        for admin_id in db.listar_admins():
+            if admin_id not in enviados:
+                notificar(admin_id, texto)
+                enviados.add(admin_id)
+
+
 def notificar_dono_com_menu_instancia(instance_name: str, prefixo: str = ""):
     """Manda pro DONO da instância o resumo + teclado inline."""
     if not bot:
@@ -317,7 +336,12 @@ def _registrar_handlers():
             badge = "👑" if u["role"] == "admin" else "👤"
             nome  = _h(u.get("name") or "—")
             n_inst = db.contar_instancias_do_dono(u["chat_id"])
-            linhas.append(f"{badge} <code>{u['chat_id']}</code> · {nome} · {n_inst} inst.")
+            extra = ""
+            if u["role"] == "user":
+                extra = " 🔔" if u.get("notify_admins") else " 🔕"
+            linhas.append(
+                f"{badge} <code>{u['chat_id']}</code> · {nome}{extra} · {n_inst} inst."
+            )
         bot.reply_to(message, "👥 <b>Usuários</b>\n" + "\n".join(linhas))
 
     @bot.message_handler(commands=["user_add"])
@@ -339,7 +363,17 @@ def _registrar_handlers():
             return
         nome = parts[2] if len(parts) > 2 else None
         db.adicionar_usuario(chat_id, role="user", name=nome)
-        bot.reply_to(message, f"✅ User <code>{chat_id}</code> cadastrado.")
+        # Pergunta se admin quer receber notificações de 'alvo detectado' desse user
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("🔔 Sim, receber",  callback_data=f"usr:notify:{chat_id}:on"),
+            types.InlineKeyboardButton("🔕 Não, obrigado", callback_data=f"usr:notify:{chat_id}:off"),
+        )
+        bot.reply_to(message,
+            f"✅ User <code>{chat_id}</code> cadastrado.\n\n"
+            f"Você quer receber no Telegram as mensagens de "
+            f"<b>'alvo detectado'</b> das instâncias desse usuário?",
+            reply_markup=kb)
 
     @bot.message_handler(commands=["user_rm"])
     def cmd_user_rm(message):
@@ -381,6 +415,37 @@ def _registrar_handlers():
                     return
 
         try:
+            # ── Toggle de "receber notificações de alvo" por user (admin only) ──
+            if data.startswith("usr:notify:"):
+                if not _check_admin(call):
+                    return
+                _, _, alvo_id_str, valor = data.split(":", 3)
+                try:
+                    alvo_id = int(alvo_id_str)
+                except ValueError:
+                    _safe_answer(call.id, "chat_id inválido", show_alert=True)
+                    return
+                ligar = (valor == "on")
+                db.set_notify_admins(alvo_id, ligar)
+                _safe_answer(call.id, "🔔 ativado" if ligar else "🔕 desativado")
+                # Atualiza a mensagem com o status novo
+                u = db.get_usuario(alvo_id) or {}
+                nome = _h(u.get("name") or "—")
+                badge = "🔔" if ligar else "🔕"
+                kb2 = types.InlineKeyboardMarkup(row_width=2)
+                kb2.add(
+                    types.InlineKeyboardButton(
+                        "🔔 Receber", callback_data=f"usr:notify:{alvo_id}:on"),
+                    types.InlineKeyboardButton(
+                        "🔕 Não receber", callback_data=f"usr:notify:{alvo_id}:off"),
+                )
+                _safe_edit(
+                    f"✅ User <code>{alvo_id}</code> ({nome}) configurado.\n"
+                    f"Notificações de 'alvo detectado': {badge}",
+                    chat_id, call.message.message_id, reply_markup=kb2,
+                )
+                return
+
             if data == "menu:main":
                 _safe_edit("🤖 <b>WhatsApp Monitor Bot</b>\nEscolha uma opção:",
                                       chat_id, call.message.message_id,
@@ -427,7 +492,10 @@ def _registrar_handlers():
                 for u in usuarios:
                     badge = "👑" if u["role"] == "admin" else "👤"
                     nome  = _h(u.get("name") or "—")
-                    linhas.append(f"{badge} <code>{u['chat_id']}</code> · {nome}")
+                    extra = ""
+                    if u["role"] == "user":
+                        extra = " 🔔" if u.get("notify_admins") else " 🔕"
+                    linhas.append(f"{badge} <code>{u['chat_id']}</code> · {nome}{extra}")
                 texto = "👥 <b>Usuários</b>\n──────────────────\n" + "\n".join(linhas)
                 texto += (
                     "\n\nComandos:\n"

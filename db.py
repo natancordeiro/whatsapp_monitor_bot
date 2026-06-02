@@ -57,14 +57,21 @@ def cursor():
 def init_db(seed_admins: list[int] | None = None):
     with cursor() as c:
         # users (substitui admins): role pode ser 'admin' ou 'user'
+        # notify_admins: se 1, os admins recebem os 'alvo detectado' desse usuário
         c.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                chat_id  INTEGER PRIMARY KEY,
-                role     TEXT NOT NULL DEFAULT 'user',
-                name     TEXT,
-                added_at TEXT DEFAULT CURRENT_TIMESTAMP
+                chat_id       INTEGER PRIMARY KEY,
+                role          TEXT NOT NULL DEFAULT 'user',
+                name          TEXT,
+                notify_admins INTEGER NOT NULL DEFAULT 0,
+                added_at      TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Migração: adiciona coluna se a tabela já existia sem ela
+        c.execute("PRAGMA table_info(users)")
+        cols = [r["name"] for r in c.fetchall()]
+        if "notify_admins" not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN notify_admins INTEGER NOT NULL DEFAULT 0")
         c.execute("""
             CREATE TABLE IF NOT EXISTS instances (
                 name             TEXT PRIMARY KEY,
@@ -184,6 +191,17 @@ def set_role(chat_id: int, role: str):
         raise ValueError("role deve ser 'admin' ou 'user'")
     with cursor() as c:
         c.execute("UPDATE users SET role = ? WHERE chat_id = ?", (role, chat_id))
+
+
+def set_notify_admins(chat_id: int, value: bool):
+    with cursor() as c:
+        c.execute("UPDATE users SET notify_admins = ? WHERE chat_id = ?",
+                  (1 if value else 0, chat_id))
+
+
+def get_notify_admins(chat_id: int) -> bool:
+    u = get_usuario(chat_id)
+    return bool(u and u.get("notify_admins"))
 
 
 # ── Instâncias ──────────────────────────────────────────────
