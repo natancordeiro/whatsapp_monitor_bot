@@ -168,12 +168,16 @@ def _verificar_uma_vez(instance_name: str, group_jid: str, msg_id: str,
     db.set_ativo(instance_name, False)
 
     if fomos_primeiro:
-        log.info(f"🏆 [{instance_name}] FOMOS OS PRIMEIROS!")
         db.incrementar_sucesso(instance_name, datetime.now().isoformat(timespec="seconds"))
+        s = db.get_stats(instance_name)
+        log.info(f"🏆 [{instance_name}] FOMOS OS PRIMEIROS! "
+                 f"stats agora: ✅ {s['sucesso']} | ❌ {s['falha']}")
         prefixo = "🏆 <b>FOMOS OS PRIMEIROS!</b>\nInstância desligada automaticamente."
     else:
-        log.warning(f"[{instance_name}] não fomos o primeiro — desligando.")
         db.incrementar_falha(instance_name)
+        s = db.get_stats(instance_name)
+        log.warning(f"[{instance_name}] não fomos o primeiro — desligando. "
+                    f"stats agora: ✅ {s['sucesso']} | ❌ {s['falha']}")
         prefixo = "⚠️ <b>Não fomos o primeiro.</b>\nInstância desligada automaticamente."
 
     telegram_handlers.notificar_dono_com_menu_instancia(instance_name, prefixo=prefixo)
@@ -354,11 +358,28 @@ if __name__ == "__main__":
     log.info("═" * 60)
 
     db.init_db(seed_admins=ADMIN_CHAT_IDS)
+    log.info(f"  DB_PATH:    {db.DB_PATH}")
+    log.info(f"  LOG_PATH:   {LOG_PATH}")
     log.info(f"  Admins:     {db.listar_admins()}")
-    log.info(f"  Instâncias: {[i['name'] for i in db.listar_instancias()]}")
+    instancias_existentes = db.listar_instancias()
+    log.info(f"  Instâncias: {[i['name'] for i in instancias_existentes]}")
+    for i in instancias_existentes:
+        s = db.get_stats(i["name"])
+        log.info(f"    └─ {i['name']:20s} ✅ {s['sucesso']} | ❌ {s['falha']} | "
+                 f"última: {s['ultima_captura'] or '—'}")
     log.info(f"  Pool size:  {SEND_POOL_SIZE}")
     log.info(f"  Porta:      {WEBHOOK_PORT}")
     log.info("═" * 60)
+
+    # Aviso se o DB está em caminho NÃO persistido (sem volume Docker)
+    if not db.DB_PATH.startswith("/data") and db.DB_PATH != "bot.db":
+        pass
+    elif db.DB_PATH.startswith("/data"):
+        import os as _os
+        if not _os.path.exists("/data"):
+            log.warning("⚠️  /data NÃO existe — DB e logs não vão persistir!")
+        elif not instancias_existentes:
+            log.info("ℹ️  Nenhuma instância salva (primeira execução ou volume vazio).")
 
     evolution.warmup()
     evolution.iniciar_keepalive_loop(intervalo_seg=25)

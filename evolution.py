@@ -88,7 +88,7 @@ def criar_instancia(instance_name: str, token: str | None = None) -> dict:
         "instanceName": instance_name,
         "qrcode":       True,
         "integration":  "WHATSAPP-BAILEYS",
-        "rejectCall":   True,
+        "rejectCall":   False,
     }
     if token:
         payload["token"] = token
