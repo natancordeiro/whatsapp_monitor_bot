@@ -45,6 +45,9 @@ WEBHOOK_URL    = os.getenv("WEBHOOK_URL", "").rstrip("/")
 ADMIN_CHAT_IDS = [int(x) for x in os.getenv("ADMIN_CHAT_IDS", "").replace(" ", "").split(",") if x]
 LOG_PATH       = os.getenv("LOG_PATH", "bot.log")
 SEND_POOL_SIZE = int(os.getenv("SEND_POOL_SIZE", "16"))
+# Quanto tempo um user comum espera antes de enviar quando há admin ativo
+# no MESMO grupo. Garante prioridade do admin em caso de concorrência.
+USER_PRIORITY_DELAY_MS = int(os.getenv("USER_PRIORITY_DELAY_MS", "150"))
 
 # ─────────────────────────────────────────────────────────────
 # LOGGING ASSÍNCRONO
@@ -94,17 +97,53 @@ def _cache_get(name: str) -> dict | None:
         # pré-computa set de alvos em lowercase pra o hot path ser O(1)
         nomes = db.parse_target_names(inst["target_name"])
         inst["_targets_lower"] = frozenset(n.strip().lower() for n in nomes if n.strip())
+        # pré-resolve a role do dono pra evitar lookup no hot path
+        owner = inst.get("owner_chat_id")
+        if owner:
+            u = db.get_usuario(owner)
+            inst["_owner_role"] = u["role"] if u else None
+        else:
+            inst["_owner_role"] = None
     with _inst_cache_lock:
         _inst_cache[name] = inst
     return inst
 
 
+# Cache de grupos onde existe uma instância de admin ATIVA.
+# Usado pra decidir se uma instância de user comum deve ceder a vez.
+_admin_groups_cache: set[str] | None = None
+_admin_groups_lock = threading.Lock()
+
+
+def _grupos_com_admin_ativo() -> set[str]:
+    global _admin_groups_cache
+    with _admin_groups_lock:
+        if _admin_groups_cache is not None:
+            return _admin_groups_cache
+        grupos: set[str] = set()
+        for inst in db.listar_instancias():
+            if not inst["ativo"]:
+                continue
+            owner = inst.get("owner_chat_id")
+            if not owner or not db.is_admin(owner):
+                continue
+            gjid = inst.get("target_group_jid")
+            if gjid:
+                grupos.add(gjid)
+        _admin_groups_cache = grupos
+        return grupos
+
+
 def _cache_invalidate(name: str | None = None):
+    global _admin_groups_cache
     with _inst_cache_lock:
         if name is None:
             _inst_cache.clear()
         else:
             _inst_cache.pop(name, None)
+    # Invalida também o cache de "grupos com admin ativo"
+    with _admin_groups_lock:
+        _admin_groups_cache = None
 
 # Plugando o invalidator no módulo db
 db.set_invalidate_hook(_cache_invalidate)
@@ -202,6 +241,13 @@ def _enviar_imediato(instance_name: str, inst: dict, msg_data: dict, t_webhook: 
                    or (message.get("extendedTextMessage") or {}).get("text")
                    or "")
     emoji       = inst["emoji"] or "🔥"
+
+    # Prioridade: se não sou admin E há admin ativo no MESMO grupo, cedo a vez
+    if (USER_PRIORITY_DELAY_MS > 0
+            and inst.get("_owner_role") != "admin"
+            and group_jid in _grupos_com_admin_ativo()):
+        log.info(f"⏳ [{instance_name}] aguardando {USER_PRIORITY_DELAY_MS}ms — admin tem prioridade no grupo")
+        time.sleep(USER_PRIORITY_DELAY_MS / 1000.0)
 
     t_send = time.perf_counter()
     try:
