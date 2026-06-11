@@ -240,6 +240,7 @@ def kb_instancia(name: str) -> types.InlineKeyboardMarkup:
             types.InlineKeyboardButton("😀 Emoji",      callback_data=f"inst:emoji:{name}"),
             types.InlineKeyboardButton("🔄 QR Code",    callback_data=f"inst:qr:{name}"),
         )
+        kb.add(types.InlineKeyboardButton("🚫 Filtros de texto", callback_data=f"inst:filtros:{name}"))
         kb.add(types.InlineKeyboardButton("🗑️ Remover", callback_data=f"inst:del:{name}"))
     kb.add(types.InlineKeyboardButton("🔙 Voltar", callback_data="menu:list_inst"))
     return kb
@@ -270,6 +271,7 @@ def _resumo_instancia(name: str, viewer_chat_id: int | None = None) -> str:
 
     grupo  = (inst['target_group_jid'] or '—')[-25:]
     emoji  = _h(inst['emoji'])
+    n_filtros = len(db.parse_textos_bloqueados(inst.get("texto_bloqueado")))
     return (
         f"📱 <b>{_h(name)}</b> — {estado}\n"
         f"──────────────────\n"
@@ -277,6 +279,7 @@ def _resumo_instancia(name: str, viewer_chat_id: int | None = None) -> str:
         f"<b>Grupo:</b> <code>{_h(grupo)}</code>\n"
         f"<b>Alvos ({len(nomes)}):</b> {alvos_str}\n"
         f"<b>Emoji:</b> {emoji}\n"
+        f"<b>Filtros de texto:</b> {n_filtros}\n"
         f"<b>Sucessos:</b> {s['sucesso']} | <b>Falhas:</b> {s['falha']}\n"
         f"<b>Última captura:</b> {captura}"
     )
@@ -597,6 +600,31 @@ def _registrar_handlers():
                     f"Digite o <b>novo emoji</b> para <code>{_h(name)}</code>:")
                 bot.register_next_step_handler(call.message, _passo_set_emoji)
 
+            elif data.startswith("inst:filtros:"):
+                name = data.split(":", 2)[2]
+                _renderizar_filtros(chat_id, call.message.message_id, name)
+
+            elif data.startswith("inst:filtro_add:"):
+                name = data.split(":", 2)[2]
+                _state(chat_id)["inst_em_config"] = name
+                bot.send_message(chat_id,
+                    f"Digite o <b>texto</b> que deve fazer <code>{_h(name)}</code> "
+                    f"ignorar a mensagem (case-insensitive, substring):")
+                bot.register_next_step_handler(call.message, _passo_add_filtro)
+
+            elif data.startswith("inst:filtro_rm:"):
+                _, _, name, idx = data.split(":", 3)
+                mapa = _state(chat_id).get("filtros") or {}
+                alvo = mapa.get(int(idx))
+                if alvo is None:
+                    _safe_answer(call.id, "Lista expirou.", show_alert=True)
+                    return
+                atuais = db.get_textos_bloqueados(name)
+                atuais = [t for t in atuais if t != alvo]
+                db.set_textos_bloqueados(name, atuais)
+                _safe_answer(call.id, f"Removido: {alvo}")
+                _renderizar_filtros(chat_id, call.message.message_id, name)
+
             elif data.startswith("inst:qr:"):
                 name = data.split(":", 2)[2]
                 _enviar_qr(chat_id, name)
@@ -691,6 +719,62 @@ def _passo_set_emoji(message):
     db.atualizar_instancia(nome_inst, emoji=valor)
     bot.reply_to(message, f"✅ Emoji atualizado: {_h(valor)}",
                  reply_markup=kb_instancia(nome_inst))
+
+
+def _passo_add_filtro(message):
+    if not _check(message): return
+    nome_inst = _state(message.from_user.id).get("inst_em_config")
+    if not nome_inst:
+        bot.reply_to(message, "Sessão expirada. Use /menu.")
+        return
+    valor = (message.text or "").strip()
+    if not valor:
+        bot.reply_to(message, "Texto vazio — nada adicionado.",
+                     reply_markup=kb_instancia(nome_inst))
+        return
+    atuais = db.get_textos_bloqueados(nome_inst)
+    # Evita duplicata case-insensitive
+    if any(t.lower() == valor.lower() for t in atuais):
+        bot.reply_to(message,
+            f"⚠️ Já existe um filtro igual: <code>{_h(valor)}</code>",
+            reply_markup=kb_instancia(nome_inst))
+        return
+    atuais.append(valor)
+    db.set_textos_bloqueados(nome_inst, atuais)
+    bot.reply_to(message,
+        f"✅ Filtro adicionado: <code>{_h(valor)}</code>\n"
+        f"Mensagens contendo esse texto serão ignoradas.",
+        reply_markup=kb_instancia(nome_inst))
+
+
+def _renderizar_filtros(chat_id: int, message_id: int, instance_name: str):
+    filtros = db.get_textos_bloqueados(instance_name)
+    mapa: dict[int, str] = {}
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    if filtros:
+        linhas = ["<i>Mensagens contendo qualquer um destes textos são "
+                  "ignoradas (case-insensitive, substring):</i>", ""]
+        for i, t in enumerate(filtros):
+            mapa[i] = t
+            linhas.append(f"• <code>{_h(t)}</code>")
+            kb.add(types.InlineKeyboardButton(
+                f"🗑️ {t[:40]}",
+                callback_data=f"inst:filtro_rm:{instance_name}:{i}"
+            ))
+        texto = "\n".join(linhas)
+    else:
+        texto = "<i>Nenhum filtro configurado — o bot responde a qualquer texto.</i>"
+
+    _state(chat_id)["filtros"] = mapa
+    kb.add(types.InlineKeyboardButton("➕ Adicionar filtro",
+                                       callback_data=f"inst:filtro_add:{instance_name}"))
+    kb.add(types.InlineKeyboardButton("🔙 Voltar",
+                                       callback_data=f"inst:open:{instance_name}"))
+    _safe_edit(
+        f"🚫 <b>Filtros de texto</b> — <code>{_h(instance_name)}</code>\n"
+        f"──────────────────\n{texto}",
+        chat_id, message_id, reply_markup=kb
+    )
 
 
 # ─────────────────────────────────────────────────────────────

@@ -82,6 +82,7 @@ def init_db(seed_admins: list[int] | None = None):
                 check_delay      REAL DEFAULT 1.5,
                 max_retries      INTEGER DEFAULT 10,
                 owner_chat_id    INTEGER,
+                texto_bloqueado  TEXT DEFAULT '["@"]',
                 criado_em        TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -110,6 +111,10 @@ def init_db(seed_admins: list[int] | None = None):
         cols = [row["name"] for row in c.fetchall()]
         if "owner_chat_id" not in cols:
             c.execute("ALTER TABLE instances ADD COLUMN owner_chat_id INTEGER")
+        if "texto_bloqueado" not in cols:
+            c.execute('ALTER TABLE instances ADD COLUMN texto_bloqueado TEXT DEFAULT \'["@"]\'')
+            # Garante o default em linhas pré-existentes
+            c.execute("UPDATE instances SET texto_bloqueado = '[\"@\"]' WHERE texto_bloqueado IS NULL")
 
         # ── Admins vêm SÓ do .env (fonte de verdade) ──
         # 1. Cria/promove a admin todo chat_id listado
@@ -297,6 +302,34 @@ def set_target_names(instance_name: str, names: list[str]):
             vistos.add(n)
             unicos.append(n)
     atualizar_instancia(instance_name, target_name=json.dumps(unicos, ensure_ascii=False))
+
+
+# ── Textos bloqueados por instância ─────────────────────────
+# Se a mensagem contiver QUALQUER um desses textos (case-insensitive),
+# o bot ignora. Mesmo formato (JSON) e regras de retrocompat de target_name.
+
+def parse_textos_bloqueados(raw: Optional[str]) -> list[str]:
+    return parse_target_names(raw)
+
+
+def get_textos_bloqueados(instance_name: str) -> list[str]:
+    inst = get_instancia(instance_name)
+    return parse_textos_bloqueados(inst["texto_bloqueado"]) if inst else []
+
+
+def set_textos_bloqueados(instance_name: str, textos: list[str]):
+    limpos = [t.strip() for t in textos if t and t.strip()]
+    vistos: set[str] = set()
+    unicos: list[str] = []
+    for t in limpos:
+        key = t.lower()
+        if key not in vistos:
+            vistos.add(key)
+            unicos.append(t)
+    atualizar_instancia(
+        instance_name,
+        texto_bloqueado=json.dumps(unicos, ensure_ascii=False),
+    )
 
 
 # ── Stats ───────────────────────────────────────────────────

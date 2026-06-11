@@ -104,6 +104,9 @@ def _cache_get(name: str) -> dict | None:
             inst["_owner_role"] = u["role"] if u else None
         else:
             inst["_owner_role"] = None
+        # pré-computa filtros de texto bloqueado (lowercase)
+        bloqueados = db.parse_textos_bloqueados(inst.get("texto_bloqueado"))
+        inst["_blocked_lower"] = tuple(b.lower() for b in bloqueados if b)
     with _inst_cache_lock:
         _inst_cache[name] = inst
     return inst
@@ -354,8 +357,14 @@ def webhook(_=None):
         texto = (message.get("conversation")
                  or (message.get("extendedTextMessage") or {}).get("text")
                  or "")
-        if not texto or "@" in texto:
+        if not texto:
             continue
+        # Filtros configuráveis por instância (case-insensitive, substring)
+        bloqueados = inst.get("_blocked_lower") or ()
+        if bloqueados:
+            texto_lower = texto.lower()
+            if any(b in texto_lower for b in bloqueados):
+                continue
 
         msg_id = key.get("id", "")
         with em_processamento_lock:
